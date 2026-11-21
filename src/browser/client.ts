@@ -520,11 +520,12 @@ export class AID {
     });
 
     if (endSession) {
-      const params = new URLSearchParams();
-      if (session?.tokens.idToken) params.set('id_token_hint', session.tokens.idToken);
-      if (safeRedirect) params.set('post_logout_redirect_uri', safeRedirect);
-      const query = params.toString();
-      redirectTo(query ? `${endSession}?${query}` : endSession);
+      // Use URL API so an end_session_endpoint that already has a query string
+      // keeps its parameters instead of getting a second '?' that swallows them.
+      const url = new URL(endSession);
+      if (session?.tokens.idToken) url.searchParams.set('id_token_hint', session.tokens.idToken);
+      if (safeRedirect) url.searchParams.set('post_logout_redirect_uri', safeRedirect);
+      redirectTo(url.toString());
       return;
     }
     if (safeRedirect) redirectTo(safeRedirect);
@@ -630,7 +631,9 @@ export class AID {
       throw new AIDAuthenticationError('The current session does not contain a refresh token');
     }
     const discovery = await this.getDiscovery();
-    if (!discovery.grant_types_supported?.includes('refresh_token')) {
+    // grant_types_supported is optional in OIDC Discovery / RFC 8414. Only reject
+    // when the provider advertises the field and omits refresh_token.
+    if (discovery.grant_types_supported && !discovery.grant_types_supported.includes('refresh_token')) {
       throw new AIDAuthenticationError('The identity provider does not advertise refresh_token support');
     }
 

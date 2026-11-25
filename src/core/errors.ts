@@ -2,8 +2,9 @@
  * Error model.
  *
  * Every failure the SDK raises is an {@link AIDError} carrying a stable `code`.
- * The codes are the same strings the Android and Swift SDKs use, so a host
- * application can map one set of codes to its UI regardless of platform:
+ * These codes are specific to the JavaScript/TypeScript SDK. The Android
+ * (`AidException` subclasses) and Swift (`AceIDError` cases) SDKs use their own
+ * platform-native error types and do not expose these string codes:
  *
  * | code                  | meaning                                                        |
  * | --------------------- | -------------------------------------------------------------- |

@@ -138,6 +138,24 @@ is available through `androidx.biometric`. Full guide:
 
 The SDK uses Authorization Code with PKCE S256 and validates the authorization transaction. Step-up parameters are requests to the identity provider, not proof of MFA or a risk decision. Enforce permissions and sensitive actions on the server.
 
+### Step-up authentication
+
+Request stronger or fresher authentication by passing OIDC parameters to `signIn()`:
+
+```ts
+await aid.signIn({ maxAge: 0, returnTo: "/settings/security" }); // force re-authentication
+// On the callback route:
+const { returnTo } = await aid.handleCallback();
+```
+
+What the SDK does and does not do:
+
+- `maxAge` and `acrValues` are sent to the identity provider as `max_age` and `acr_values`. The provider performs the authentication.
+- When `maxAge` is set, `handleCallback()` additionally rejects an ID token whose `auth_time` is missing or older than `maxAge` (plus clock skew) with an `AIDTokenError`. This is the only step-up check the SDK enforces locally.
+- `acr_values` is a request. The SDK does not verify an `acr` or `amr` claim, and whether a given Ace ID deployment honors `acr_values` is not verified by this SDK.
+- Android accepts `maxAgeSeconds` and `acrValues` on its authorization request. Swift accepts `max_age` through `additionalParameters` and enforces `auth_time` the same way.
+- A successful step-up is not authorization. Your backend must authorize every sensitive operation (security settings, payments, privileged actions) itself; never rely on client state.
+
 For installation, API details, AIDC configuration, token refresh, logout, troubleshooting, and release status, use the [full SDK documentation](https://docs.ace-base.cc/projects/ace-id-sdk).
 
 ## License

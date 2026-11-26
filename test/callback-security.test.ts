@@ -119,11 +119,14 @@ describe('callback hardening', () => {
     const storage = new MemoryStorage();
     seedTransaction(storage);
 
-    await expect(
-      client(storage, fixture.issuer).handleCallback(
+    let providerError: unknown;
+    try {
+      await client(storage, fixture.issuer).handleCallback(
         `${REDIRECT}?error=access_denied&error_description=user+cancelled&state=expected-state`,
-      ),
-    ).rejects.toThrow(/access_denied/);
+      );
+    } catch (error) { providerError = error; }
+    expect(providerError).toBeInstanceOf(AIDCallbackError);
+    expect(providerError).toMatchObject({ details: { reason: 'provider_cancelled' } });
 
     expect(storage.get('aid:transaction')).toBeNull();
     expect(storage.get('aid:session')).toBeNull();

@@ -2,9 +2,9 @@
 /**
  * Bundle-size budget check.
  *
- * The SDK ships five entry points. Two of them are imported by every application
- * that signs a user in, so their size is a product decision, not a detail: a
- * login helper that costs 80 kB gzipped is a reason to reach for a competitor.
+ * The SDK ships six entry points. The core and server entries are imported by
+ * applications that sign a user in, so their size is a product decision, not a
+ * detail: a login helper that costs 80 kB gzipped is a reason to reach for a competitor.
  *
  * The budgets are deliberately generous (they include the `jose` JWT library) but
  * finite, so an accidental dependency or a large table cannot land unnoticed.
@@ -21,6 +21,7 @@ const BUDGETS = {
   'index.js': 45,
   'index.cjs': 45,
   'react/index.js': 4,
+  'ui/index.js': 50,
   'server/index.js': 30,
   'diagnostics.js': 15,
   'testing/oidc-mock.js': 6,
@@ -30,6 +31,7 @@ const BUDGETS = {
 const FORBIDDEN = [
   { file: 'react/index.js', pattern: /\bfrom ['"]react-dom/, why: 'react-dom must not be bundled' },
   { file: 'index.js', pattern: /\bfrom ['"]react['"]/, why: 'react must not be bundled into the core entry' },
+  { file: 'ui/index.js', pattern: /\bfrom ['"]react['"]/, why: 'the UI subpath must not require React' },
 ];
 
 let failures = 0;

@@ -6,6 +6,10 @@ on:
       - 'package.json'
       - 'package-lock.json'
       - 'README.md'
+      - 'CHANGELOG.md'
+      - 'RELEASE-CHECKLIST.md'
+      - 'scripts/**'
+      - 'examples/popup/**'
       - 'tsup*.ts'
       - 'tsconfig*.json'
       - 'vitest.config.*'
@@ -15,13 +19,17 @@ on:
       - 'Sources/**'
       - 'Tests/**'
       - 'android/**'
+      - '.github/workflows/ci.yml'
+      - '.github/workflows/android.yml'
+      - '.github/workflows/android-publish.yml'
+      - '.github/workflows/ios.yml'
       - '.github/workflows/release.yml'
   workflow_dispatch:
     inputs:
       version:
         description: "Semantic version to build"
         required: true
-        default: "0.2.4"
+        default: "0.2.5"
       publish_release:
         description: "Create a GitHub Release after all build/test jobs pass (main only)"
         required: true
@@ -47,13 +55,13 @@ jobs:
     steps:
       - name: Validate version and publishing branch
         env:
-          RELEASE_VERSION: ${{ inputs.version || '0.2.4' }}
+          RELEASE_VERSION: ${{ inputs.version || '0.2.5' }}
           PUBLISH_RELEASE: ${{ inputs.publish_release || false }}
           PUBLISH_NPM: ${{ inputs.publish_npm || false }}
         run: |
           set -euo pipefail
-          test "$RELEASE_VERSION" = "0.2.4" || {
-            echo "This release workflow is scoped to 0.2.4; received: $RELEASE_VERSION" >&2
+          test "$RELEASE_VERSION" = "0.2.5" || {
+            echo "This release workflow is scoped to 0.2.5; received: $RELEASE_VERSION" >&2
             exit 1
           }
           if { [ "$PUBLISH_RELEASE" = "true" ] || [ "$PUBLISH_NPM" = "true" ]; } && [ "$GITHUB_REF" != "refs/heads/main" ]; then
@@ -74,9 +82,13 @@ jobs:
           node-version: 22
           cache: npm
       - name: Verify package version
-        run: node -e "const p=require('./package.json'); if (p.version !== '0.2.4') throw new Error('Expected package.json version 0.2.4, got '+p.version)"
+        run: node -e "const p=require('./package.json'); if (p.version !== '0.2.5') throw new Error('Expected package.json version 0.2.5, got '+p.version)"
       - name: Install locked dependencies
-        run: npm ci
+        run: npm ci --no-fund
+      - name: Audit production and development dependencies
+        run: |
+          npm audit --omit=dev
+          npm audit
       - name: Typecheck, test, and build
         run: |
           npm run typecheck
@@ -91,21 +103,28 @@ jobs:
           set -euo pipefail
           mkdir -p release
           npm pack --pack-destination release
-          tar -tzf release/ace-id-sdk-0.2.4.tgz > release/npm-tarball-files.txt
+          tar -tzf release/ace-id-sdk-0.2.5.tgz > release/npm-tarball-files.txt
           grep -q '^package/dist/index.js$' release/npm-tarball-files.txt
           grep -q '^package/dist/index.cjs$' release/npm-tarball-files.txt
           grep -q '^package/dist/index.d.ts$' release/npm-tarball-files.txt
+          grep -q '^package/dist/index.d.cts$' release/npm-tarball-files.txt
           grep -q '^package/dist/react/index.js$' release/npm-tarball-files.txt
+          grep -q '^package/dist/react/index.cjs$' release/npm-tarball-files.txt
           grep -q '^package/dist/server/index.js$' release/npm-tarball-files.txt
+          grep -q '^package/dist/ui/index.js$' release/npm-tarball-files.txt
+          grep -q '^package/dist/ui/index.cjs$' release/npm-tarball-files.txt
+          grep -q '^package/dist/testing/oidc-mock.js$' release/npm-tarball-files.txt
           grep -q '^package/dist/diagnostics.js$' release/npm-tarball-files.txt
           if grep -qE '^package/(src|test|scripts)/' release/npm-tarball-files.txt; then
-            echo "Release tarball must not contain sources or tests." >&2
+            echo "Release tarball must not contain sources, tests, or release scripts." >&2
             exit 1
           fi
+          npm run verify:tarball -- release/ace-id-sdk-0.2.5.tgz
           mkdir -p /tmp/npm-package-check
-          tar -xzf release/ace-id-sdk-0.2.4.tgz -C /tmp/npm-package-check package/README.md package/LICENSE
+          tar -xzf release/ace-id-sdk-0.2.5.tgz -C /tmp/npm-package-check package/README.md package/LICENSE package/FONT-LICENSE.txt
           test -f /tmp/npm-package-check/package/README.md
           test -f /tmp/npm-package-check/package/LICENSE
+          test -f /tmp/npm-package-check/package/FONT-LICENSE.txt
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: release-node
@@ -135,9 +154,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release
-          cp android/library/build/outputs/aar/library-release.aar release/ace-id-sdk-android-0.2.4.aar
+          cp android/library/build/outputs/aar/library-release.aar release/ace-id-sdk-android-0.2.5.aar
           cd release
-          sha256sum ace-id-sdk-android-0.2.4.aar > ace-id-sdk-android-0.2.4.aar.sha256
+          sha256sum ace-id-sdk-android-0.2.5.aar > ace-id-sdk-android-0.2.5.aar.sha256
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: release-android
@@ -188,8 +207,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release
-          git archive --format=tar --prefix=ace-id-sdk/ "$GITHUB_SHA" Package.swift Sources Tests README.md | gzip -n > release/ace-id-sdk-swift-source-0.2.4.tar.gz
-          tar -tzf release/ace-id-sdk-swift-source-0.2.4.tar.gz >/dev/null
+          git archive --format=tar --prefix=ace-id-sdk/ "$GITHUB_SHA" Package.swift Sources Tests README.md LICENSE CHANGELOG.md | gzip -n > release/ace-id-sdk-swift-source-0.2.5.tar.gz
+          tar -tzf release/ace-id-sdk-swift-source-0.2.5.tar.gz >/dev/null
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: release-swift
@@ -219,20 +238,20 @@ jobs:
       - name: Verify package identity and install dependencies
         run: |
           set -euo pipefail
-          node -e "const p=require('./package.json'); if (p.name !== 'ace-id-sdk' || p.version !== '0.2.4' || p.repository.url !== 'https://github.com/tab-gl/aid-sdk.git') throw new Error('Unexpected npm package identity, version, or repository')"
-          npm ci
+          node -e "const p=require('./package.json'); if (p.name !== 'ace-id-sdk' || p.version !== '0.2.5' || p.repository.url !== 'https://github.com/tab-gl/aid-sdk.git') throw new Error('Unexpected npm package identity, version, or repository')"
+          npm ci --no-fund
       - name: Use an npm version that supports trusted publishing
         run: |
           set -euo pipefail
-          npm install -g npm@^11.5.1
+          npm install -g npm@^11.5.1 --no-fund
           npm --version
       - name: Check whether this version is already published
         id: published
         run: |
           set -euo pipefail
-          if v=$(npm view "ace-id-sdk@0.2.4" version 2>/dev/null) && [ "$v" = "0.2.4" ]; then
+          if v=$(npm view "ace-id-sdk@0.2.5" version 2>/dev/null) && [ "$v" = "0.2.5" ]; then
             echo "already=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::ace-id-sdk@0.2.4 is already on npm; skipping publish."
+            echo "::notice::ace-id-sdk@0.2.5 is already on npm; skipping publish."
           else
             echo "already=false" >> "$GITHUB_OUTPUT"
           fi
@@ -277,33 +296,39 @@ jobs:
           RELEASE_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          test "$RELEASE_VERSION" = "0.2.4"
-          test -f release/ace-id-sdk-0.2.4.tgz
-          test -f release/ace-id-sdk-android-0.2.4.aar
-          test -f release/ace-id-sdk-swift-source-0.2.4.tar.gz
+          test "$RELEASE_VERSION" = "0.2.5"
+          test -f release/ace-id-sdk-0.2.5.tgz
+          test -f release/ace-id-sdk-android-0.2.5.aar
+          test -f release/ace-id-sdk-swift-source-0.2.5.tar.gz
           if git ls-remote --tags origin "refs/tags/$RELEASE_VERSION" | grep -q .; then
             echo "Tag $RELEASE_VERSION already exists; refusing to overwrite or retarget it." >&2
             exit 1
           fi
-          sha256sum release/ace-id-sdk-0.2.4.tgz release/ace-id-sdk-android-0.2.4.aar release/ace-id-sdk-swift-source-0.2.4.tar.gz > release/SHA256SUMS
-          # Reproducible release gate: the manifest must verify against the artifacts.
-          sha256sum -c release/SHA256SUMS
-          # Every artifact must be non-empty and the AAR must carry the published version.
-          for artifact in release/ace-id-sdk-0.2.4.tgz release/ace-id-sdk-android-0.2.4.aar release/ace-id-sdk-swift-source-0.2.4.tar.gz; do
+          (
+            cd release
+            sha256sum ace-id-sdk-0.2.5.tgz ace-id-sdk-android-0.2.5.aar ace-id-sdk-swift-source-0.2.5.tar.gz > SHA256SUMS
+            # Reproducible release gate: the manifest must verify beside downloaded assets.
+            sha256sum -c SHA256SUMS
+          )
+          # Every downloaded release artifact must be non-empty.
+          for artifact in release/ace-id-sdk-0.2.5.tgz release/ace-id-sdk-android-0.2.5.aar release/ace-id-sdk-swift-source-0.2.5.tar.gz; do
             test -s "$artifact"
           done
-          cat > release/RELEASE-NOTES.md <<'NOTES'
-          # Ace ID SDK 0.2.4
-
-          This release includes the JavaScript/TypeScript npm package, the source-distributed iOS Swift Package, and the Android AAR.
+          awk '
+            index($0, "## [0.2.5]") == 1 { print "# Ace ID SDK 0.2.5"; copying = 1; next }
+            copying && index($0, "## [") == 1 { exit }
+            copying { print }
+          ' CHANGELOG.md > release/RELEASE-NOTES.md
+          test -s release/RELEASE-NOTES.md
+          cat >> release/RELEASE-NOTES.md <<'NOTES'
 
           ## Install
 
-          - npm: `npm install ace-id-sdk@0.2.4`
-          - Swift Package: add `https://github.com/tab-gl/aid-sdk` and select version `0.2.4`.
-          - Android: download `ace-id-sdk-android-0.2.4.aar` and verify it against `SHA256SUMS`.
+          - npm: `npm install ace-id-sdk@0.2.5` after npm publication, or install from the attached tarball with `npm install ./ace-id-sdk-0.2.5.tgz`.
+          - Swift Package: add `https://github.com/tab-gl/aid-sdk` and select version `0.2.5`.
+          - Android: use the attached AAR build artifact and verify it against `SHA256SUMS`; Maven Central uses a separate signed user-managed bundle.
 
-          The artifacts are produced only after the npm checks, Android unit tests/AAR assembly, and iOS Simulator compile/tests pass.
+          This workflow builds the JavaScript/TypeScript npm package tarball, an Android AAR, and the source-distributed iOS Swift Package. If enabled, npm publication uses provenance; the signed Android Maven Central bundle is a separate user-managed staging/publication. Artifacts are produced only after npm checks, Android unit tests/AAR assembly, and iOS Simulator compile/tests pass.
           NOTES
       - name: Publish release assets
         env:
@@ -312,10 +337,10 @@ jobs:
         run: |
           set -euo pipefail
           gh release create "$RELEASE_VERSION" \
-            release/ace-id-sdk-0.2.4.tgz \
-            release/ace-id-sdk-android-0.2.4.aar \
-            release/ace-id-sdk-android-0.2.4.aar.sha256 \
-            release/ace-id-sdk-swift-source-0.2.4.tar.gz \
+            release/ace-id-sdk-0.2.5.tgz \
+            release/ace-id-sdk-android-0.2.5.aar \
+            release/ace-id-sdk-android-0.2.5.aar.sha256 \
+            release/ace-id-sdk-swift-source-0.2.5.tar.gz \
             release/SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \

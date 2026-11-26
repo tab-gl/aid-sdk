@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi, type Mock } from 'vitest';
 import { AID } from '../src/browser/client.js';
 import { createCodeChallenge } from '../src/browser/pkce.js';
 import { MemoryStorage } from '../src/browser/storage.js';
@@ -29,11 +29,11 @@ function discoveryDocument(): Record<string, unknown> {
 interface FakePopupEnvironment {
   parent: Window;
   popup: Window;
-  parentLocation: { href: string; origin: string; assign: ReturnType<typeof vi.fn> };
+  parentLocation: { href: string; origin: string; assign: Mock<(url: string) => void> };
   popupLocation: { href: string };
-  open: ReturnType<typeof vi.fn>;
-  popupPostMessage: ReturnType<typeof vi.fn>;
-  parentPostMessage: ReturnType<typeof vi.fn>;
+  open: Mock<() => Window | null>;
+  popupPostMessage: Mock<(data: unknown, targetOrigin: string) => void>;
+  parentPostMessage: Mock<(data: unknown, targetOrigin: string) => void>;
   dispatchToParent(source: Window, origin: string, data: unknown): void;
   dispatchToPopup(source: Window, origin: string, data: unknown): void;
   dispatchPageHide(): void;
@@ -48,7 +48,7 @@ function createPopupEnvironment(blocked = false): FakePopupEnvironment {
   const parentLocation = {
     href: 'https://app.example.test/sign-in',
     origin: 'https://app.example.test',
-    assign: vi.fn(),
+    assign: vi.fn((_url: string) => undefined),
   };
   const popupLocation = { href: 'about:blank' };
   let closed = false;
@@ -538,6 +538,35 @@ describe('popup authentication', () => {
     expect(storage.get('aid:transaction')).toBeNull();
   });
 
+  it('cancels popup preparation on demand and clears its transaction and flow lock', async () => {
+    const environment = createPopupEnvironment();
+    let releaseDiscovery!: () => void;
+    const discoveryGate = new Promise<void>((resolve) => { releaseDiscovery = resolve; });
+    const fetchMock = vi.fn(async () => {
+      await discoveryGate;
+      return json(discoveryDocument());
+    });
+    vi.stubGlobal('window', environment.parent);
+    vi.stubGlobal('location', environment.parentLocation);
+    vi.stubGlobal('fetch', fetchMock);
+
+    const storage = new MemoryStorage();
+    const client = new AID({ issuer: ISSUER, clientId: CLIENT_ID, redirectUri: REDIRECT, storage });
+    const signIn = client.signInWithPopup();
+    expect(environment.open).toHaveBeenCalledTimes(1);
+    expect(client.cancelPopupSignIn()).toBe(true);
+    expect(client.cancelPopupSignIn()).toBe(false);
+    expect(environment.popupIsClosed()).toBe(true);
+
+    releaseDiscovery();
+    let cancelled: unknown;
+    try { await signIn; } catch (error) { cancelled = error; }
+    expect(cancelled).toMatchObject({ code: 'AUTHENTICATION_ERROR', details: { reason: 'user_cancelled' } });
+    expect(storage.get('aid:transaction')).toBeNull();
+    expect(storage.get('aid:authorization-flow-lock')).toBeNull();
+    expect(client.cancelPopupSignIn()).toBe(false);
+  });
+
   it('reports a blocked popup without starting discovery', async () => {
     const environment = createPopupEnvironment(true);
     const fetchMock = vi.fn(async () => json(discoveryDocument()));
@@ -547,7 +576,10 @@ describe('popup authentication', () => {
 
     const storage = new MemoryStorage();
     const client = new AID({ issuer: ISSUER, clientId: CLIENT_ID, redirectUri: REDIRECT, storage });
-    await expect(client.signInWithPopup()).rejects.toBeInstanceOf(AIDAuthenticationError);
+    let blockedError: unknown;
+    try { await client.signInWithPopup(); } catch (error) { blockedError = error; }
+    expect(blockedError).toBeInstanceOf(AIDAuthenticationError);
+    expect(blockedError).toMatchObject({ details: { reason: 'popup_blocked' } });
     expect(environment.open).toHaveBeenCalledTimes(1);
     expect(fetchMock).not.toHaveBeenCalled();
     expect(storage.get('aid:authorization-flow-lock')).toBeNull();
@@ -556,8 +588,9 @@ describe('popup authentication', () => {
     await client.signIn();
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(environment.parentLocation.assign).toHaveBeenCalledTimes(1);
-    expect(new URL(environment.parentLocation.assign.mock.calls[0]?.[0]).searchParams.get('response_type'))
-      .toBe('code');
+    const assignedUrl = environment.parentLocation.assign.mock.calls[0]?.[0];
+    expect(assignedUrl).toBeDefined();
+    expect(new URL(assignedUrl as string).searchParams.get('response_type')).toBe('code');
     expect(storage.get('aid:transaction')).not.toBeNull();
   });
 
@@ -669,7 +702,12 @@ describe('popup authentication', () => {
     await waitFor(() => environment.popupLocation.href.includes('/authorize?'), 'the authorization URL');
 
     environment.popup.close();
-    await expect(signIn).rejects.toThrow(/closed before authentication/i);
+    let cancelled: unknown;
+    try { await signIn; } catch (error) { cancelled = error; }
+    expect(cancelled).toMatchObject({
+      code: 'AUTHENTICATION_ERROR',
+      details: { reason: 'popup_closed' },
+    });
     expect(storage.get('aid:transaction')).toBeNull();
   });
 

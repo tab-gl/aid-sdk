@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createElement } from 'react';
-import { act, create, type ReactTestRenderer } from 'react-test-renderer';
+import { act, createElement } from 'react';
+import type { ReactNode } from 'react';
+import { createRoot, type Root } from 'react-dom/client';
 import { renderToString } from 'react-dom/server';
+import { parseHTML } from 'linkedom';
 import {
   AceIDProvider,
   AuthProvider,
@@ -43,11 +45,34 @@ function Probe(): ReturnType<typeof createElement> {
 }
 
 describe('React adapter', () => {
-  let renderer: ReactTestRenderer | undefined;
+  let clientRoot: Root | undefined;
 
-  afterEach(() => {
-    renderer?.unmount();
-    renderer = undefined;
+  async function renderClient(node: ReactNode): Promise<HTMLElement> {
+    const { window } = parseHTML('<html><body><div id="root"></div></body></html>');
+    vi.stubGlobal('window', window);
+    vi.stubGlobal('document', window.document);
+    vi.stubGlobal('navigator', window.navigator);
+    vi.stubGlobal('HTMLElement', window.HTMLElement);
+    vi.stubGlobal('Node', window.Node);
+    vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
+
+    const container = window.document.getElementById('root');
+    if (!container) throw new Error('React test root was not created');
+    clientRoot = createRoot(container);
+    await act(async () => {
+      clientRoot?.render(node);
+    });
+    return container;
+  }
+
+  async function unmountClient(): Promise<void> {
+    if (clientRoot) await act(async () => clientRoot?.unmount());
+    clientRoot = undefined;
+  }
+
+  afterEach(async () => {
+    await unmountClient();
+    vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
 
@@ -67,12 +92,11 @@ describe('React adapter', () => {
 
   it('hydrates the session on mount and exposes the user', async () => {
     const client = clientWithSession();
-    await act(async () => {
-      renderer = create(createElement(AceIDProvider, { client }, createElement(Probe)));
-    });
-    const text = JSON.stringify(renderer?.toJSON());
-    expect(text).toContain('authenticated');
-    expect(text).toContain('user@example.test');
+    const container = await renderClient(
+      createElement(AceIDProvider, { client }, createElement(Probe)),
+    );
+    expect(container.textContent).toContain('authenticated');
+    expect(container.textContent).toContain('user@example.test');
   });
 
   it('updates when the session changes outside React', async () => {
@@ -85,16 +109,15 @@ describe('React adapter', () => {
       token_endpoint: `${ISSUER}/token`,
       jwks_uri: `${ISSUER}/jwks`,
     }), { status: 200, headers: { 'content-type': 'application/json' } })));
-    await act(async () => {
-      renderer = create(createElement(AuthProvider, { client }, createElement(Probe)));
-    });
-    expect(JSON.stringify(renderer?.toJSON())).toContain('authenticated');
+    const container = await renderClient(
+      createElement(AuthProvider, { client }, createElement(Probe)),
+    );
+    expect(container.textContent).toContain('authenticated');
 
     await act(async () => {
       await client.signOut();
     });
-    expect(JSON.stringify(renderer?.toJSON())).toContain('unauthenticated');
-    vi.unstubAllGlobals();
+    expect(container.textContent).toContain('unauthenticated');
   });
 
   it('exposes actions from useAceIDActions', async () => {
@@ -104,9 +127,7 @@ describe('React adapter', () => {
       actions = useAceIDActions();
       return createElement('span', null, 'ready');
     }
-    await act(async () => {
-      renderer = create(createElement(AceIDProvider, { client }, createElement(ActionsProbe)));
-    });
+    await renderClient(createElement(AceIDProvider, { client }, createElement(ActionsProbe)));
     expect(typeof actions?.signIn).toBe('function');
     expect(typeof actions?.signInWithPopup).toBe('function');
     expect(typeof actions?.handlePopupCallback).toBe('function');
@@ -118,27 +139,23 @@ describe('React adapter', () => {
 
   it('gates children behind authentication', async () => {
     const authed = clientWithSession();
-    await act(async () => {
-      renderer = create(
-        createElement(AceIDProvider, { client: authed },
-          createElement(ProtectedRoute, { fallback: createElement('span', null, 'denied') },
-            createElement('span', null, 'secret'))),
-      );
-    });
-    expect(JSON.stringify(renderer?.toJSON())).toContain('secret');
+    const authenticatedContainer = await renderClient(
+      createElement(AceIDProvider, { client: authed },
+        createElement(ProtectedRoute, { fallback: createElement('span', null, 'denied') },
+          createElement('span', null, 'secret'))),
+    );
+    expect(authenticatedContainer.textContent).toContain('secret');
 
-    renderer?.unmount();
+    await unmountClient();
     const anonymous = new AID({
       issuer: ISSUER, clientId: 'c', redirectUri: REDIRECT, storage: new MemoryStorage(),
     });
-    await act(async () => {
-      renderer = create(
-        createElement(AceIDProvider, { client: anonymous },
-          createElement(ProtectedRoute, { fallback: createElement('span', null, 'denied') },
-            createElement('span', null, 'secret'))),
-      );
-    });
-    expect(JSON.stringify(renderer?.toJSON())).toContain('denied');
+    const anonymousContainer = await renderClient(
+      createElement(AceIDProvider, { client: anonymous },
+        createElement(ProtectedRoute, { fallback: createElement('span', null, 'denied') },
+          createElement('span', null, 'secret'))),
+    );
+    expect(anonymousContainer.textContent).toContain('denied');
   });
 
   it('surfaces the precise SDK state', async () => {
@@ -154,9 +171,7 @@ describe('React adapter', () => {
       state = useAceID().authState?.status;
       return createElement('span', null, state ?? 'none');
     }
-    await act(async () => {
-      renderer = create(createElement(AceIDProvider, { client }, createElement(StateProbe)));
-    });
+    await renderClient(createElement(AceIDProvider, { client }, createElement(StateProbe)));
     expect(state).toBe('expired');
   });
 });

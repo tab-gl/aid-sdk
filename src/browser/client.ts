@@ -146,7 +146,7 @@ export class AID {
   private autoRefreshActive: boolean;
   private readonly processingCallbackStates = new Set<string>();
   private popupSignInActive = false;
-  private cancelPopupSignIn?: (error: unknown) => void;
+  private cancelActivePopupSignIn?: (error: unknown) => boolean;
   /**
    * Bumped whenever the session is cleared. An in-flight refresh compares it
    * after its network round trip so a logout cannot be undone by a late write.
@@ -342,6 +342,14 @@ export class AID {
     let waitingForCallback = false;
     let pageHidden = false;
     let completion: PopupWaitHandle | undefined;
+    let cancellationError: unknown;
+    this.cancelActivePopupSignIn = (error) => {
+      if (cancellationError !== undefined) return false;
+      cancellationError = error;
+      completion?.cancel(error);
+      closePopup(popup);
+      return true;
+    };
     const pageHideError = new AIDAuthenticationError(
       'Page was navigated or refreshed while popup sign-in was pending',
     );
@@ -365,6 +373,7 @@ export class AID {
         options.maxAge,
       );
       state = request.state;
+      if (cancellationError !== undefined) throw cancellationError;
       if (pageHidden) throw pageHideError;
       if (this.sessionEpoch !== sessionEpoch) {
         throw new AIDAuthenticationError('Sign-out occurred while popup sign-in was being prepared');
@@ -376,7 +385,6 @@ export class AID {
       });
 
       completion = this.waitForPopupCallback(popup, request.state, sessionEpoch);
-      this.cancelPopupSignIn = completion.cancel;
       waitingForCallback = true;
       try {
         // Setting the cross-origin Location is allowed by the browser and keeps
@@ -398,9 +406,22 @@ export class AID {
     } finally {
       try { browserWindow.removeEventListener('pagehide', onPageHide); } catch { /* best-effort listener cleanup */ }
       this.releaseAuthorizationFlowLock(flowLockId);
-      this.cancelPopupSignIn = undefined;
+      this.cancelActivePopupSignIn = undefined;
       this.popupSignInActive = false;
     }
+  }
+
+  /**
+   * Cancel the active popup sign-in, closing its popup and clearing the pending
+   * authorization transaction. Returns `false` when no popup flow is active.
+   */
+  cancelPopupSignIn(): boolean {
+    if (!this.cancelActivePopupSignIn) return false;
+    return this.cancelActivePopupSignIn(new AIDAuthenticationError(
+      'Popup sign-in was cancelled by the user',
+      undefined,
+      { details: { reason: 'user_cancelled' } },
+    ));
   }
 
   /**
@@ -550,6 +571,8 @@ export class AID {
       throw new AIDCallbackError(
         `Authorization error: ${params.error}` +
           (params.errorDescription ? ` — ${params.errorDescription}` : ''),
+        undefined,
+        params.error === 'access_denied' ? { details: { reason: 'provider_cancelled' } } : undefined,
       );
     }
     if (!params.code || !params.state) {
@@ -788,7 +811,11 @@ export class AID {
     // clearSession() also advances the epoch, so a refresh already in flight
     // cannot re-persist the session after logout.
     this.clearSession();
-    this.cancelPopupSignIn?.(new AIDAuthenticationError('Popup sign-in was cancelled by sign-out'));
+    this.cancelActivePopupSignIn?.(new AIDAuthenticationError(
+      'Popup sign-in was cancelled by sign-out',
+      undefined,
+      { details: { reason: 'sign_out' } },
+    ));
     this.config.storage.remove(this.transactionKey);
     const safeRedirect = options.redirectTo
       ? validatePostLogoutRedirect(
@@ -1247,7 +1274,11 @@ export class AID {
     closePoll = setInterval(() => {
       try {
         if (popup.closed) {
-          finish(new AIDAuthenticationError('Sign-in popup was closed before authentication completed'));
+          finish(new AIDAuthenticationError(
+            'Sign-in popup was closed before authentication completed',
+            undefined,
+            { details: { reason: 'popup_closed' } },
+          ));
         }
       } catch {
         // Window.closed is cross-origin readable, but a broken proxy should not
@@ -1491,7 +1522,12 @@ function getBrowserWindow(): Window {
 
 function openAuthenticationPopup(browserWindow: Window = getBrowserWindow()): Window {
   if (typeof browserWindow.open !== 'function') {
-    throw new AIDError('CONFIGURATION_ERROR', 'Popup authentication is not available in this browser');
+    throw new AIDError(
+      'CONFIGURATION_ERROR',
+      'Popup authentication is not available in this browser',
+      undefined,
+      { details: { reason: 'popup_unavailable' } },
+    );
   }
   const width = 520;
   const height = 680;
@@ -1506,11 +1542,17 @@ function openAuthenticationPopup(browserWindow: Window = getBrowserWindow()): Wi
       `popup=yes,width=${width},height=${height},left=${left},top=${top},resizable=yes,scrollbars=yes`,
     );
   } catch (err) {
-    throw new AIDAuthenticationError('Could not open the sign-in popup', err);
+    throw new AIDAuthenticationError(
+      'Could not open the sign-in popup',
+      err,
+      { details: { reason: 'popup_blocked' } },
+    );
   }
   if (!popup) {
     throw new AIDAuthenticationError(
       'Sign-in popup was blocked; allow popups for this site or use signIn() for redirect authentication',
+      undefined,
+      { details: { reason: 'popup_blocked' } },
     );
   }
   return popup;

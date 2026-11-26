@@ -46,7 +46,9 @@ export interface AuthContextValue {
   returnTo: string | null;
   refreshSession(): void;
   signIn(options?: AIDAuthorizationOptions & { returnTo?: string }): Promise<void>;
+  signInWithPopup(options?: AIDAuthorizationOptions & { returnTo?: string }): Promise<AIDCallbackResult>;
   handleCallback(url?: string): Promise<AIDCallbackResult>;
+  handlePopupCallback(url?: string): Promise<void>;
   signOut(options?: { redirectTo?: string }): Promise<void>;
   fetchProfile(): Promise<AIDUser>;
 }
@@ -124,6 +126,21 @@ export function AuthProvider({ client, children, hydrateOnMount = true }: AuthPr
     }
   }, [client]);
 
+  const signInWithPopup = useCallback(async (options?: AIDAuthorizationOptions & { returnTo?: string }) => {
+    setError(null);
+    try {
+      const next = await client.signInWithPopup(options ?? {});
+      setSession(next);
+      setReturnTo(next.returnTo ?? null);
+      setStatus('authenticated');
+      return next;
+    } catch (cause) {
+      setError(toError(cause));
+      setStatus('error');
+      throw cause;
+    }
+  }, [client]);
+
   const handleCallback = useCallback(async (url?: string) => {
     setStatus('loading');
     setError(null);
@@ -133,6 +150,17 @@ export function AuthProvider({ client, children, hydrateOnMount = true }: AuthPr
       setReturnTo(next.returnTo ?? null);
       setStatus('authenticated');
       return next;
+    } catch (cause) {
+      setError(toError(cause));
+      setStatus('error');
+      throw cause;
+    }
+  }, [client]);
+
+  const handlePopupCallback = useCallback(async (url?: string) => {
+    setError(null);
+    try {
+      await client.handlePopupCallback(url);
     } catch (cause) {
       setError(toError(cause));
       setStatus('error');
@@ -177,12 +205,14 @@ export function AuthProvider({ client, children, hydrateOnMount = true }: AuthPr
     returnTo,
     refreshSession,
     signIn,
+    signInWithPopup,
     handleCallback,
+    handlePopupCallback,
     signOut,
     fetchProfile,
   }), [
     client, session, status, authState, error, returnTo,
-    refreshSession, signIn, handleCallback, signOut, fetchProfile,
+    refreshSession, signIn, signInWithPopup, handleCallback, handlePopupCallback, signOut, fetchProfile,
   ]);
 
   return createElement(AuthContext.Provider, { value }, children);
@@ -215,19 +245,23 @@ export function useAceIDSession(): {
 /** The action half of the context, so a button can subscribe without re-rendering on every token change. */
 export function useAceIDActions(): {
   signIn(options?: AIDAuthorizationOptions & { returnTo?: string }): Promise<void>;
+  signInWithPopup(options?: AIDAuthorizationOptions & { returnTo?: string }): Promise<AIDCallbackResult>;
   signOut(options?: { redirectTo?: string }): Promise<void>;
   logout(options?: { redirectTo?: string }): Promise<void>;
   refresh(): void;
   handleCallback(url?: string): Promise<AIDCallbackResult>;
+  handlePopupCallback(url?: string): Promise<void>;
   fetchProfile(): Promise<AIDUser>;
 } {
-  const { signIn, signOut, refreshSession, handleCallback, fetchProfile } = useAceID();
+  const { signIn, signInWithPopup, signOut, refreshSession, handleCallback, handlePopupCallback, fetchProfile } = useAceID();
   return {
     signIn,
+    signInWithPopup,
     signOut,
     logout: signOut,
     refresh: refreshSession,
     handleCallback,
+    handlePopupCallback,
     fetchProfile,
   };
 }

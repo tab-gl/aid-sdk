@@ -62,6 +62,32 @@ describe('callback hardening', () => {
     expect(fixture.tokenRequests()).toBe(0);
   });
 
+  it('rejects an authorization response whose issuer parameter is unexpected', async () => {
+    fixture = await startOidcFixture();
+    const storage = new MemoryStorage();
+    seedTransaction(storage);
+
+    await expect(
+      client(storage, fixture.issuer).handleCallback(
+        `${REDIRECT}?code=abc&state=expected-state&iss=https%3A%2F%2Fevil.example.test`,
+      ),
+    ).rejects.toThrow(/issuer does not match/i);
+    expect(storage.get('aid:transaction')).not.toBeNull();
+    expect(fixture.tokenRequests()).toBe(0);
+  });
+
+  it('accepts a callback issuer URI with the same normalization used by client configuration', async () => {
+    fixture = await startOidcFixture();
+    const storage = new MemoryStorage();
+    seedTransaction(storage);
+
+    const result = await client(storage, fixture.issuer).handleCallback(
+      `${REDIRECT}?code=abc&state=expected-state&iss=${encodeURIComponent(`${fixture.issuer}/`)}`,
+    );
+    expect(result.user.sub).toBe('user-1');
+    expect(fixture.tokenRequests()).toBe(1);
+  });
+
   it('rejects duplicate authorization parameters', async () => {
     fixture = await startOidcFixture();
     const storage = new MemoryStorage();
@@ -103,6 +129,34 @@ describe('callback hardening', () => {
     expect(storage.get('aid:session')).toBeNull();
   });
 
+  it('does not clear the active transaction for a provider error with forged state', async () => {
+    fixture = await startOidcFixture();
+    const storage = new MemoryStorage();
+    seedTransaction(storage);
+
+    await expect(
+      client(storage, fixture.issuer).handleCallback(
+        `${REDIRECT}?error=access_denied&state=forged-state`,
+      ),
+    ).rejects.toThrow(/state mismatch/i);
+    expect(storage.get('aid:transaction')).not.toBeNull();
+    expect(fixture.tokenRequests()).toBe(0);
+  });
+
+  it('does not let a stale code callback erase a newer transaction', async () => {
+    fixture = await startOidcFixture();
+    const storage = new MemoryStorage();
+    seedTransaction(storage, { state: 'new-active-state' });
+    const aid = client(storage, fixture.issuer);
+
+    await expect(
+      aid.handleCallback(`${REDIRECT}?code=stale-code&state=old-state`),
+    ).rejects.toThrow(/state mismatch/i);
+
+    expect(JSON.parse(storage.get('aid:transaction') as string).state).toBe('new-active-state');
+    expect(fixture.tokenRequests()).toBe(0);
+  });
+
   it('cannot replay a consumed code', async () => {
     fixture = await startOidcFixture();
     const storage = new MemoryStorage();
@@ -116,6 +170,23 @@ describe('callback hardening', () => {
     await expect(
       aid.handleCallback(`${REDIRECT}?code=abc&state=expected-state`),
     ).rejects.toThrow(/No authorization transaction/i);
+  });
+
+  it('exchanges a callback code only once when the same state is submitted concurrently', async () => {
+    fixture = await startOidcFixture();
+    const storage = new MemoryStorage();
+    seedTransaction(storage);
+    const aid = client(storage, fixture.issuer);
+    const callbackUrl = `${REDIRECT}?code=single-use&state=expected-state`;
+
+    const results = await Promise.allSettled([
+      aid.handleCallback(callbackUrl),
+      aid.handleCallback(callbackUrl),
+    ]);
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    const rejected = results.find((result) => result.status === 'rejected');
+    expect(rejected?.status === 'rejected' && rejected.reason).toBeInstanceOf(AIDCallbackError);
+    expect(fixture.tokenRequests()).toBe(1);
   });
 
   it('rejects an ID token whose nonce does not match the transaction', async () => {

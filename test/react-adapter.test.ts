@@ -108,6 +108,8 @@ describe('React adapter', () => {
       renderer = create(createElement(AceIDProvider, { client }, createElement(ActionsProbe)));
     });
     expect(typeof actions?.signIn).toBe('function');
+    expect(typeof actions?.signInWithPopup).toBe('function');
+    expect(typeof actions?.handlePopupCallback).toBe('function');
     expect(typeof actions?.signOut).toBe('function');
     expect(actions?.logout).toBe(actions?.signOut);
     expect(typeof actions?.refresh).toBe('function');

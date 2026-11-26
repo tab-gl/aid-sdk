@@ -37,6 +37,39 @@ const session = await aid.handleCallback();
 console.log(session.user);
 ```
 
+### Popup sign-in
+
+`signInWithPopup()` uses the same Authorization Code + PKCE flow while leaving the current page open. It opens a blank popup synchronously (call it directly from a user click), then navigates it to the issuer. Keep popup relay and top-level redirect exchange on separate callback routes. Because each `AID` client has one `redirectUri`, configure one client per route:
+
+```ts
+const common = { issuer: "https://identity.example.com", clientId: "your-public-client-id" };
+const popupClient = new AID({
+  ...common,
+  redirectUri: "https://app.example.com/auth/popup-callback",
+});
+const redirectClient = new AID({
+  ...common,
+  redirectUri: "https://app.example.com/auth/redirect-callback",
+});
+
+// In the app's sign-in button:
+const session = await popupClient.signInWithPopup({ prompt: "select_account" });
+console.log(session.user);
+
+// On the popup-only callback route:
+await popupClient.handlePopupCallback();
+
+// If popups are blocked, offer this explicit redirect fallback instead:
+await redirectClient.signIn({ returnTo: "/dashboard" });
+
+// On the redirect-only callback route:
+const redirectedSession = await redirectClient.handleCallback();
+```
+
+Use the same storage configuration for both clients so the app reads the session produced by either flow. The opener validates the callback origin/path, state and optional OIDC `iss` response parameter, exchanges the code once, verifies the ID token, and stores the session. The popup relays only the callback URL through a source- and origin-checked `postMessage` handshake; tokens are never sent between windows. `handlePopupCallback()` closes the popup after the opener reports completion. Keep each callback page on its registered origin/path and avoid stripping its query before the SDK handles it. Refreshing or navigating the opener while a popup is pending cancels the attempt and closes the popup. Popups are not a good mobile default, and browser `Cross-Origin-Opener-Policy` settings can sever the opener connection. A runnable static [popup demo, setup guide and browser test record](examples/popup/README.md) are included.
+
+Ace ID provides the authentication flow, not provider-specific UI: the issuer controls account selection, consent and social-provider buttons. Pass supported OIDC hints such as `prompt` or `loginHint` through the shared authorization options; if your issuer documents a provider-selection parameter, pass it with `additionalParameters` (there is no universal OIDC `provider` parameter). The React adapter exposes `signInWithPopup()` and `handlePopupCallback()` through `useAceIDActions()` as well.
+
 Session state, refresh and profile:
 
 ```ts

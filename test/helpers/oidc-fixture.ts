@@ -1,4 +1,5 @@
 import * as http from 'node:http';
+import { createHash } from 'node:crypto';
 import type { AddressInfo } from 'node:net';
 import { exportJWK, generateKeyPair, SignJWT } from 'jose';
 
@@ -7,8 +8,8 @@ import { exportJWK, generateKeyPair, SignJWT } from 'jose';
  *
  * `jose` fetches remote JWK sets with `node:http`/`node:https` rather than the
  * global `fetch`, so a stubbed `fetch` cannot intercept a JWKS request. This
- * fixture serves discovery, JWKS, token, revocation and logout endpoints over a
- * real loopback HTTP server, which is also exempt from the SDK's HTTPS rule.
+ * fixture serves authorization, discovery, JWKS, token, revocation and logout
+ * endpoints over a real loopback HTTP server, which is exempt from the SDK's HTTPS rule.
  */
 export interface OidcFixtureOptions {
   clientId?: string;
@@ -18,6 +19,21 @@ export interface OidcFixtureOptions {
   expiresIn?: number | null;
   /** Optional gate applied to token requests, for race tests. */
   tokenGate?: Promise<void>;
+  /** Require codes to have been issued by the fixture's /authorize endpoint. */
+  requireAuthorizationCodeRegistration?: boolean;
+  /** Lifetime for codes issued by /authorize. Negative values generate expired codes in tests. */
+  authorizationCodeLifetimeMs?: number;
+  /** Return an OAuth error for selected authorization codes (for provider-error tests). */
+  rejectAuthorizationCode?: (code: string) => boolean;
+}
+
+interface IssuedAuthorizationCode {
+  clientId: string;
+  redirectUri: string;
+  codeChallenge: string;
+  nonce: string;
+  expiresAt: number;
+  used: boolean;
 }
 
 export interface OidcFixture {
@@ -27,6 +43,8 @@ export interface OidcFixture {
   tokenRequests(): number;
   requests: Array<{ path: string; body?: string }>;
   setJwks(jwks: unknown): void;
+  setNonce(nonce: string): void;
+  setCodeChallenge(challenge: string): void;
   signIdToken(claims: Record<string, unknown>, kid?: string): Promise<string>;
   close(): Promise<void>;
 }
@@ -34,12 +52,17 @@ export interface OidcFixture {
 export async function startOidcFixture(options: OidcFixtureOptions = {}): Promise<OidcFixture> {
   const clientId = options.clientId ?? 'client-1';
   const nonce = options.nonce ?? 'nonce-1';
+  let nonceOverride: string | undefined;
   const kid = options.kid ?? 'k1';
   const expiresIn = options.expiresIn === undefined ? 3600 : options.expiresIn;
 
   const { privateKey, publicKey } = await generateKeyPair('RS256');
   const jwk = await exportJWK(publicKey);
   let jwks: unknown = { keys: [{ ...jwk, kid, alg: 'RS256', use: 'sig' }] };
+  let expectedCodeChallenge: string | undefined;
+  const authorizationCodes = new Map<string, IssuedAuthorizationCode>();
+  const usedAuthorizationCodes = new Set<string>();
+  let authorizationCodeSequence = 0;
   let jwksFetches = 0;
   let tokenRequests = 0;
   const requests: Array<{ path: string; body?: string }> = [];
@@ -79,6 +102,51 @@ export async function startOidcFixture(options: OidcFixtureOptions = {}): Promis
       return;
     }
 
+    if (path === '/authorize') {
+      const authorizationRequest = new URL(req.url ?? '/', issuer);
+      const requestedClientId = authorizationRequest.searchParams.get('client_id');
+      const redirectUri = authorizationRequest.searchParams.get('redirect_uri');
+      const state = authorizationRequest.searchParams.get('state');
+      const codeChallenge = authorizationRequest.searchParams.get('code_challenge');
+      const nonce = authorizationRequest.searchParams.get('nonce');
+      if (authorizationRequest.searchParams.get('response_type') !== 'code' ||
+          requestedClientId !== clientId || !redirectUri || !state || !nonce ||
+          !codeChallenge || authorizationRequest.searchParams.get('code_challenge_method') !== 'S256') {
+        send({ error: 'invalid_request' }, 400);
+        return;
+      }
+
+      let callback: URL;
+      try {
+        callback = new URL(redirectUri);
+        const secureRedirect = callback.protocol === 'https:' ||
+          (callback.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(callback.hostname));
+        if (!secureRedirect) {
+          send({ error: 'invalid_request' }, 400);
+          return;
+        }
+      } catch {
+        send({ error: 'invalid_request' }, 400);
+        return;
+      }
+
+      const code = `fixture-code-${++authorizationCodeSequence}`;
+      authorizationCodes.set(code, {
+        clientId: requestedClientId,
+        redirectUri: callback.toString(),
+        codeChallenge,
+        nonce,
+        expiresAt: Date.now() + (options.authorizationCodeLifetimeMs ?? 60_000),
+        used: false,
+      });
+      requests.push({ path });
+      callback.searchParams.set('code', code);
+      callback.searchParams.set('state', state);
+      res.writeHead(302, { location: callback.toString(), 'cache-control': 'no-store' });
+      res.end();
+      return;
+    }
+
     if (path === '/jwks') {
       jwksFetches += 1;
       send(jwks);
@@ -115,9 +183,38 @@ export async function startOidcFixture(options: OidcFixtureOptions = {}): Promis
             return;
           }
 
+          const code = form.get('code') ?? '';
+          const verifier = form.get('code_verifier') ?? '';
+          const codeChallenge = createHash('sha256').update(verifier).digest('base64url');
+          const issuedCode = authorizationCodes.get(code);
+          if (options.requireAuthorizationCodeRegistration && !issuedCode) {
+            send({ error: 'invalid_grant', error_description: 'Authorization code was not issued by this provider' }, 400);
+            return;
+          }
+          if (issuedCode && (issuedCode.used || issuedCode.expiresAt <= Date.now())) {
+            send({ error: 'invalid_grant', error_description: 'Authorization code is expired or already used' }, 400);
+            return;
+          }
+          if (issuedCode && (form.get('client_id') !== issuedCode.clientId ||
+              form.get('redirect_uri') !== issuedCode.redirectUri ||
+              codeChallenge !== issuedCode.codeChallenge)) {
+            send({ error: 'invalid_grant', error_description: 'Authorization code binding or PKCE verification failed' }, 400);
+            return;
+          }
+          if (expectedCodeChallenge !== undefined && codeChallenge !== expectedCodeChallenge) {
+            send({ error: 'invalid_grant', error_description: 'PKCE code_verifier does not match' }, 400);
+            return;
+          }
+          if (usedAuthorizationCodes.has(code) || options.rejectAuthorizationCode?.(code)) {
+            send({ error: 'invalid_grant', error_description: 'Authorization code is expired or already used' }, 400);
+            return;
+          }
+          if (issuedCode) issuedCode.used = true;
+          usedAuthorizationCodes.add(code);
+
           send({
             access_token: `access-token-${generation}`,
-            id_token: await signIdToken({}),
+            id_token: await signIdToken({ nonce: nonceOverride ?? issuedCode?.nonce ?? nonce }),
             refresh_token: `refresh-${generation}`,
             token_type: 'Bearer',
             ...(expiresIn === null ? {} : { expires_in: expiresIn }),
@@ -146,6 +243,12 @@ export async function startOidcFixture(options: OidcFixtureOptions = {}): Promis
     requests,
     setJwks: (next: unknown) => {
       jwks = next;
+    },
+    setNonce: (next: string) => {
+      nonceOverride = next;
+    },
+    setCodeChallenge: (challenge: string) => {
+      expectedCodeChallenge = challenge;
     },
     signIdToken,
     close: () =>

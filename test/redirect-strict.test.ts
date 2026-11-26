@@ -38,8 +38,10 @@ describe('assertCallbackUrl', () => {
       .toThrow(/HTTPS/i);
   });
 
-  it('rejects duplicated authorization parameters', () => {
+  it('rejects duplicated authorization and issuer parameters', () => {
     expect(() => assertCallbackUrl(`${REDIRECT}?code=a&code=b&state=s`, REDIRECT))
+      .toThrow(/duplicate/i);
+    expect(() => assertCallbackUrl(`${REDIRECT}?code=a&state=s&iss=one&iss=two`, REDIRECT))
       .toThrow(/duplicate/i);
   });
 

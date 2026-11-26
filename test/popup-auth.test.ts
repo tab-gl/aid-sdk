@@ -696,6 +696,37 @@ describe('popup authentication', () => {
     expect(storage.get('aid:authorization-flow-lock')).toBeNull();
   });
 
+  it('closes the popup on timeout even if the callback page stopped listening', async () => {
+    const environment = createPopupEnvironment();
+    vi.stubGlobal('window', environment.parent);
+    vi.stubGlobal('location', environment.parentLocation);
+    vi.stubGlobal('fetch', vi.fn(async () => json(discoveryDocument())));
+
+    const storage = new MemoryStorage();
+    const client = new AID({
+      issuer: ISSUER,
+      clientId: CLIENT_ID,
+      redirectUri: REDIRECT,
+      storage,
+      transactionTtlMs: 200,
+    });
+    const signIn = client.signInWithPopup();
+    await waitFor(() => environment.popupLocation.href.includes('/authorize?'), 'the authorization URL');
+    const transaction = JSON.parse(storage.get('aid:transaction') as string) as { state: string };
+
+    environment.popupLocation.href = `${REDIRECT}?code=unused&state=${transaction.state}`;
+    environment.dispatchToParent(environment.popup, 'https://app.example.test', {
+      protocol: 'ace-id-popup-v1',
+      type: 'hello',
+      state: transaction.state,
+    });
+    // No callback listener is installed to answer the challenge or completion.
+    await expect(signIn).rejects.toThrow(/timed out/i);
+    expect(environment.popupIsClosed()).toBe(true);
+    expect(storage.get('aid:transaction')).toBeNull();
+    expect(storage.get('aid:authorization-flow-lock')).toBeNull();
+  });
+
   it('prevents a late callback from saving a session or clearing a newer transaction after timeout', async () => {
     let releaseTokenExchange!: () => void;
     const tokenGate = new Promise<void>((resolve) => { releaseTokenExchange = resolve; });

@@ -1148,9 +1148,9 @@ export class AID {
         }
         sendCompletion(false, completionState);
         try { this.clearTransactionForState(state); } catch { /* preserve the original error */ }
-        // When the callback helper has completed its handshake, it closes itself
-        // after receiving the final message. Otherwise close the abandoned window.
-        if (!callbackOrigin) closePopup(popup);
+        // Close from the opener even if the callback page has navigated away and
+        // can no longer receive the completion message.
+        closePopup(popup);
         rejectPromise(error);
         return;
       }

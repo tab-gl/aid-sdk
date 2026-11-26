@@ -1,6 +1,6 @@
 # v0.2.5 release checklist
 
-**Release state:** prepared on the active feature-freeze branch; not tagged or published. Do not publish this branch. The exact-release-commit gates below remain mandatory after merge to `main`.
+**Release state:** v0.2.5 candidate is merged to `main`; it is not tagged or published. The release workflow has been run with both publishing inputs disabled. Do not publish until the exact-release-commit and manual gates below are satisfied.
 
 ## Candidate verification record — 2026-11-26
 
@@ -10,7 +10,7 @@
 - [x] `npm run verify` passed: ESM and CommonJS entry points, NodeNext ESM/CJS declarations, SSR import/construction with explicit storage, and bundle budgets (UI entry: **40.9 kB gzip**).
 - [x] On 2026-11-26, the v0.2.5 tarball was installed into a clean consumer: all six public subpaths loaded in ESM and CommonJS; explicit-storage SSR construction and Web Crypto PKCE generation passed in both on Node 20.20.2; NodeNext resolved `.d.ts`/`.d.cts` declarations for every subpath; and tree-shaking produced an **8,113 B** named `createCodeVerifier` bundle versus an **80,429 B** namespace bundle. Re-run this on the exact release commit.
 - [x] Headless Chromium 158.0.8127.0 / Playwright 1.65.1 on Linux: keyboard focus/trap/restore, mobile viewport bounds, popup and redirect PKCE flows, session reload, provider cancellation, direct callback recovery, and COOP opener loss passed against the local OIDC fixture. This is not a live issuer or assistive-technology test.
-- [x] All GitHub Actions workflows passed `actionlint`; YAML parsing and `bash -n` passed for all 43 `run:` blocks. Release-note generation preserved Markdown code spans, and the checksum manifest verified using paths relative to downloaded assets.
+- [x] All GitHub Actions workflows passed `actionlint`; YAML parsing and `bash -n` passed for all 43 `run:` blocks. Release-note generation preserved Markdown code spans, and the checksum manifest verified using paths relative to downloaded assets. Artifact upload/download actions are pinned to Node 24-compatible `actions/upload-artifact` v7.0.2 and `actions/download-artifact` v8.0.2 SHAs, addressing the deprecated Node 20 runtime notice from the first no-publish run.
 - [x] Dependency tree is consistent: `npm ci` and `npm ls` pass with one deduplicated esbuild **0.28.2** across tsup, Vite, and the checker; `@types/node`, `@types/react`, and linkedom are updated to compatible patches.
 - [x] Full `npm audit` and `npm audit --omit=dev`: **0 vulnerabilities**.
 - [x] React adapter test warning removed by using the React DOM renderer for client-side tests; Node 20/22 test runs pass without the prior mixed-renderer warning.
@@ -19,7 +19,7 @@
 
 ## Exact release commit gates
 
-- [ ] Merge the candidate to `main`; record the full release commit SHA and verify the checkout is clean.
+- [ ] After the release-workflow action updates are merged, record the full release commit SHA and verify the `main` checkout is clean.
 - [ ] Run the Node CI matrix and the release-build workflow on that exact SHA. Confirm typecheck, tests, build, package exports, bundle budgets, actual installed tarball, Android tests/AAR, and iOS Simulator tests all pass for the same commit.
 - [ ] Re-run `npm audit` and `npm audit --omit=dev` on the exact release commit; require **0 vulnerabilities** or record maintainer approval for any newly disclosed advisory.
 - [ ] Inspect the exact `.tgz` contents and verify the v0.2.5 tarball installs from the generated artifact; confirm ESM, CommonJS, types, SSR, and tree-shaking results.

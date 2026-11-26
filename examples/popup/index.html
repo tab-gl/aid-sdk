@@ -97,11 +97,18 @@
         background: #8a97aa;
         box-shadow: 0 0 0 4px rgba(138, 151, 170, .12);
       }
-      #status { margin: 0; color: #53627a; font-size: 13px; overflow-wrap: anywhere; }
+      .status-copy { min-width: 0; flex: 1; }
+      #status { margin: 0; color: #53627a; font-size: 13px; font-weight: 650; overflow-wrap: anywhere; }
       #status[data-state="authenticated"] { color: #18745b; }
+      .status-help { margin: 5px 0 0; color: #748198; font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; }
+      .status-details { margin-top: 8px; color: #68768c; font-size: 11px; }
+      .status-details summary { width: fit-content; cursor: pointer; font-weight: 700; }
+      .status-details code { display: block; margin-top: 6px; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
       .status-card[data-state="authenticated"] .status-dot { background: #19a678; box-shadow: 0 0 0 4px rgba(25, 166, 120, .12); }
       .status-card[data-state="error"] { border-color: #f2d8dd; background: #fff8f8; }
       .status-card[data-state="error"] .status-dot { background: #c75a69; box-shadow: 0 0 0 4px rgba(199, 90, 105, .12); }
+      .status-card[data-state="expired"], .status-card[data-state="refresh-failed"] { border-color: #f1e5cf; background: #fffaf1; }
+      .status-card[data-state="expired"] .status-dot, .status-card[data-state="refresh-failed"] .status-dot { background: #c38a32; box-shadow: 0 0 0 4px rgba(195, 138, 50, .12); }
       .status-card[data-state="pending"] .status-dot { background: #526fe0; animation: pulse 1.15s ease-in-out infinite; }
       @keyframes pulse { 50% { box-shadow: 0 0 0 7px rgba(82, 111, 224, .08); } }
       .profile {
@@ -172,7 +179,7 @@
         .card { border-radius: 20px; }
       }
       @media (prefers-reduced-motion: reduce) {
-        *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; }
+        *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; }
       }
     </style>
   </head>
@@ -181,29 +188,36 @@
       <div class="brand"><span class="brand-mark" aria-hidden="true">A</span><span>Ace ID · Browser SDK</span></div>
       <section class="card" aria-labelledby="page-title">
         <p class="eyebrow">Example application</p>
-        <h1 id="page-title">Welcome back.</h1>
-        <p class="intro">Sign in securely without leaving this page, or choose a full-page redirect.</p>
+        <h1 id="page-title">Sign in to your account.</h1>
+        <p class="intro">Choose a sign-in method. Your identity provider handles your credentials and consent.</p>
 
-        <div class="status-card" id="status-card" role="status" aria-live="polite">
+        <div class="status-card" id="status-card" data-state="pending" role="status" aria-live="polite">
           <span class="status-dot" aria-hidden="true"></span>
-          <p id="status" data-state="unauthenticated">Checking your session…</p>
+          <div class="status-copy">
+            <p id="status" data-state="pending">Checking this tab’s session…</p>
+            <p class="status-help" id="status-help" hidden></p>
+            <details class="status-details" id="status-details" hidden>
+              <summary>Technical details</summary>
+              <code id="status-detail"></code>
+            </details>
+          </div>
         </div>
         <div class="profile" id="profile-card" hidden>
           <span class="profile-icon" aria-hidden="true">✓</span>
-          <div><span class="profile-label">Verified with your issuer</span><span id="profile"></span></div>
+          <div><span class="profile-label" id="profile-label">Signed in as</span><span id="profile"></span></div>
         </div>
 
         <div class="actions">
           <button class="primary" id="popup-sign-in" type="button">
-            <span>Continue with secure popup</span><span class="arrow" aria-hidden="true">↗</span>
+            <span id="popup-button-label">Continue with popup</span><span class="arrow" aria-hidden="true">↗</span>
           </button>
-          <button class="secondary" id="redirect-sign-in" type="button">Use full-page redirect</button>
+          <button class="secondary" id="redirect-sign-in" type="button"><span id="redirect-button-label">Continue with full-page redirect</span></button>
           <button class="sign-out" id="sign-out" type="button" hidden>Sign out</button>
         </div>
 
-        <p class="note"><span class="note-mark" aria-hidden="true">ⓘ</span><span>Your identity provider controls account selection and consent. This demo never collects provider credentials.</span></p>
+        <p class="note"><span class="note-mark" aria-hidden="true">ⓘ</span><span>Popup sign-in opens a separate window. On mobile or when popups are restricted, choose the full-page redirect.</span></p>
       </section>
-      <footer>Authorization Code + PKCE · Tokens stay in the opener's session</footer>
+      <footer>Authorization Code + PKCE · Tokens stay in this app tab</footer>
     </main>
     <script src="../../dist/ace-id-sdk.global.js"></script>
     <script src="./config.local.js"></script>

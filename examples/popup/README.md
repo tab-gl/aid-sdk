@@ -46,7 +46,7 @@ A small static integration reference for browser sign-in. It uses the built IIFE
    python3 -m http.server 8000 --bind 0.0.0.0
    ```
 
-4. Open `http://localhost:8000/examples/popup/index.html`. Try **Sign in with popup**, **Sign in with redirect**, and **Sign out**.
+4. Open `http://localhost:8000/examples/popup/index.html`. Try **Continue with popup**, **Continue with full-page redirect**, and **Sign out**.
 
 `ACE_ID_ISSUER` and `ACE_ID_CLIENT_ID` are public values and are delivered to the browser in `config.local.js`; they are not secrets. The generator does not read or embed client secrets. Never add a client secret to this demo, a `.env` file used by a frontend, or any browser bundle.
 
@@ -54,8 +54,9 @@ The two app clients share the default `sessionStorage` prefix. A single tab cann
 
 ## Expected behavior and troubleshooting
 
-- **Popup blocked:** the SDK rejects the popup request and does not navigate the main page. Enable popups for the app or use **Sign in with redirect**.
-- **Callback page opened directly:** `callback.html` reports that it has no live opener and does not exchange the code. Start sign-in from the demo; use the redirect button for a top-level callback.
+- **Popup blocked:** the SDK rejects the popup request and does not navigate the main page. The demo explains the fallback; enable popups for the app or choose **Continue with full-page redirect**.
+- **Popup closed or cancelled:** the main page cancels the attempt, clears its transaction, and restores both sign-in choices. Try again or choose redirect. If the provider returns `access_denied`, the demo says sign-in was cancelled and no session was created.
+- **Callback page opened directly:** `callback.html` reports that it has no live opener and does not exchange the code. Close the window and start sign-in from the demo; use the redirect button for a top-level callback.
 - **COOP or opener severed:** `Cross-Origin-Opener-Policy: same-origin` can break the opener channel. The popup callback reports failure and leaves the code unexchanged; use redirect sign-in. If popup UX is required, test `same-origin-allow-popups` with the app and provider's response headers. Do not add `noopener` to the auth popup or relax state/origin/PKCE checks.
 - **Refresh/navigation while pending:** the opener's `pagehide` handler cancels the attempt, closes the popup, and clears the matching transaction and flow lock. Start a new attempt after the page loads.
 - **Redirect URI mismatch:** register both exact printed callback URIs, including scheme, host, port, and path. Do not register `config.local.js` or the app page as a callback.

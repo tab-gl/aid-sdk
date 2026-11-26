@@ -34,6 +34,7 @@ import { createLogger, type AIDLogger } from '../core/logging.js';
 import { fetchUserProfile as requestUserProfile } from '../core/profile.js';
 import {
   assertCallbackUrl,
+  isSecureUrl,
   normalizeReturnTo,
   validatePostLogoutRedirect,
 } from '../core/redirect.js';
@@ -69,6 +70,29 @@ const MAX_TOKEN_RESPONSE_BYTES = 1024 * 1024;
  * event loop when a provider reports an already-expired token.
  */
 const MIN_AUTO_REFRESH_DELAY_MS = 1_000;
+const MAX_POPUP_CALLBACK_URL_LENGTH = 8 * 1024;
+const POPUP_CLOSE_POLL_MS = 200;
+const POPUP_MESSAGE_PROTOCOL = 'ace-id-popup-v1';
+const POPUP_MESSAGE_TYPES = new Set(['hello', 'challenge', 'callback', 'complete']);
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+interface PopupWaitHandle {
+  promise: Promise<AIDCallbackResult>;
+  cancel(error: unknown): void;
+}
+
+interface PopupWireMessage {
+  protocol: string;
+  type: string;
+  state: string;
+  url?: unknown;
+  ok?: unknown;
+}
+
+interface AuthorizationFlowLock {
+  id: string;
+  createdAt: number;
+}
 
 interface ResolvedAIDConfig {
   issuer: string;
@@ -115,10 +139,14 @@ export class AID {
   private readonly logger: AIDLogger;
   private readonly state = new SessionStateEmitter();
   private readonly transactionKey: string;
+  private readonly authorizationFlowLockKey: string;
   private readonly sessionKey: string;
   private refreshPromise?: Promise<AIDSession>;
   private refreshTimer?: ReturnType<typeof setTimeout>;
   private autoRefreshActive: boolean;
+  private readonly processingCallbackStates = new Set<string>();
+  private popupSignInActive = false;
+  private cancelActivePopupSignIn?: (error: unknown) => boolean;
   /**
    * Bumped whenever the session is cleared. An in-flight refresh compares it
    * after its network round trip so a logout cannot be undone by a late write.
@@ -184,6 +212,7 @@ export class AID {
       retry: { maxRetries },
     });
     this.transactionKey = `${this.config.storageKeyPrefix}:transaction`;
+    this.authorizationFlowLockKey = `${this.config.storageKeyPrefix}:authorization-flow-lock`;
     this.sessionKey = `${this.config.storageKeyPrefix}:session`;
     this.autoRefreshActive = this.config.autoRefresh;
     // Hydrate the observable state so a listener attached immediately after
@@ -200,70 +229,350 @@ export class AID {
     this.discoveryCache.clear();
   }
 
-  async signIn(options: AIDAuthorizationOptions & { returnTo?: string } = {}): Promise<void> {
-    const authorizationOptions = normalizeAuthorizationOptions(options);
-    // Validate before navigating: an off-origin or malformed target must fail
-    // here rather than be handed to the host app after a successful login.
-    const returnTo = normalizeReturnTo(
-      options.returnTo,
-      this.config.redirectUri,
-      this.config.additionalRedirectOrigins,
-    );
+  private async createAuthorizationRequest(
+    authorizationOptions: Record<string, string>,
+    returnTo?: string,
+    maxAgeSeconds?: number,
+  ): Promise<{ authorizationUrl: string; state: string }> {
     const discovery = await this.getDiscovery();
     const state = randomString(32);
     const nonce = randomString(32);
     const codeVerifier = createCodeVerifier();
     const codeChallenge = await createCodeChallenge(codeVerifier);
     const transaction: AuthTransaction = {
-      state, nonce, codeVerifier, redirectUri: this.config.redirectUri,
+      state,
+      nonce,
+      codeVerifier,
+      redirectUri: this.config.redirectUri,
       createdAt: Date.now(),
-      ...(options.maxAge !== undefined ? { maxAgeSeconds: options.maxAge } : {}),
+      ...(maxAgeSeconds !== undefined ? { maxAgeSeconds } : {}),
       ...(returnTo !== undefined ? { returnTo } : {}),
     };
+
+    const authorizationUrl = new URL(discovery.authorization_endpoint);
+    const params = new URLSearchParams({
+      response_type: 'code',
+      client_id: this.config.clientId,
+      redirect_uri: this.config.redirectUri,
+      scope: this.config.scope,
+      state,
+      nonce,
+      code_challenge: codeChallenge,
+      code_challenge_method: 'S256',
+    });
+    for (const [key, value] of Object.entries(authorizationOptions)) params.set(key, value);
+    // Preserve issuer-specific query parameters, but replace collisions with the
+    // SDK-owned values and never append parameters after a URL fragment.
+    for (const [key, value] of params) authorizationUrl.searchParams.set(key, value);
 
     try {
       this.config.storage.set(this.transactionKey, JSON.stringify(transaction));
     } catch (err) {
       throw new AIDError('STORAGE_ERROR', 'Failed to persist authorization transaction', err);
     }
+    return { authorizationUrl: authorizationUrl.toString(), state };
+  }
 
-    const authorizationUrl = new URL(discovery.authorization_endpoint);
-    const params = new URLSearchParams({
-      response_type: 'code', client_id: this.config.clientId,
-      redirect_uri: this.config.redirectUri, scope: this.config.scope,
-      state, nonce, code_challenge: codeChallenge, code_challenge_method: 'S256',
+  async signIn(options: AIDAuthorizationOptions & { returnTo?: string } = {}): Promise<void> {
+    if (this.popupSignInActive) {
+      throw new AIDAuthenticationError('A popup sign-in is already in progress for this client');
+    }
+    const flowLockId = randomString(16);
+    this.acquireAuthorizationFlowLock(flowLockId);
+    try {
+      const authorizationOptions = normalizeAuthorizationOptions(options);
+      // Validate before navigating: an off-origin or malformed target must fail
+      // here rather than be handed to the host app after a successful login.
+      const returnTo = normalizeReturnTo(
+        options.returnTo,
+        this.config.redirectUri,
+        this.config.additionalRedirectOrigins,
+      );
+      const request = await this.createAuthorizationRequest(
+        authorizationOptions,
+        returnTo,
+        options.maxAge,
+      );
+      this.logger.info('signin.start', 'Starting authorization code flow with PKCE', {
+        issuer: this.config.issuer,
+        prompt: authorizationOptions.prompt,
+        mode: 'redirect',
+      });
+      redirectTo(request.authorizationUrl);
+    } finally {
+      this.releaseAuthorizationFlowLock(flowLockId);
+    }
+  }
+
+  /**
+   * Start Authorization Code + PKCE in a separate browser window.
+   *
+   * The blank popup is opened synchronously, before discovery or Web Crypto work,
+   * so browsers can associate it with the user's click. The registered callback
+   * page must call {@link AID#handlePopupCallback}; the opener validates and
+   * exchanges the callback itself, so tokens never cross the window boundary.
+   */
+  async signInWithPopup(
+    options: AIDAuthorizationOptions & { returnTo?: string } = {},
+  ): Promise<AIDCallbackResult> {
+    if (this.popupSignInActive) {
+      throw new AIDAuthenticationError('A popup sign-in is already in progress for this client');
+    }
+    const authorizationOptions = normalizeAuthorizationOptions(options);
+    const returnTo = normalizeReturnTo(
+      options.returnTo,
+      this.config.redirectUri,
+      this.config.additionalRedirectOrigins,
+    );
+
+    // This must happen before the first await or the browser may block the popup.
+    const browserWindow = getBrowserWindow();
+    const flowLockId = randomString(16);
+    this.acquireAuthorizationFlowLock(flowLockId);
+    let popup: Window;
+    try {
+      popup = openAuthenticationPopup(browserWindow);
+    } catch (err) {
+      this.releaseAuthorizationFlowLock(flowLockId);
+      throw err;
+    }
+    const sessionEpoch = this.sessionEpoch;
+    this.popupSignInActive = true;
+    let state: string | undefined;
+    let waitingForCallback = false;
+    let pageHidden = false;
+    let completion: PopupWaitHandle | undefined;
+    let cancellationError: unknown;
+    this.cancelActivePopupSignIn = (error) => {
+      if (cancellationError !== undefined) return false;
+      cancellationError = error;
+      completion?.cancel(error);
+      closePopup(popup);
+      return true;
+    };
+    const pageHideError = new AIDAuthenticationError(
+      'Page was navigated or refreshed while popup sign-in was pending',
+    );
+    const onPageHide = (): void => {
+      if (pageHidden) return;
+      pageHidden = true;
+      completion?.cancel(pageHideError);
+      if (state) {
+        try { this.clearTransactionForState(state); } catch { /* page teardown cleanup is best-effort */ }
+      }
+      closePopup(popup);
+      // Do this synchronously; the old document may not reach its promise finally
+      // block before a reload creates the next SDK instance in this tab.
+      this.releaseAuthorizationFlowLock(flowLockId);
+    };
+    try {
+      browserWindow.addEventListener('pagehide', onPageHide);
+      const request = await this.createAuthorizationRequest(
+        authorizationOptions,
+        returnTo,
+        options.maxAge,
+      );
+      state = request.state;
+      if (cancellationError !== undefined) throw cancellationError;
+      if (pageHidden) throw pageHideError;
+      if (this.sessionEpoch !== sessionEpoch) {
+        throw new AIDAuthenticationError('Sign-out occurred while popup sign-in was being prepared');
+      }
+      this.logger.info('signin.start', 'Starting authorization code flow with PKCE', {
+        issuer: this.config.issuer,
+        prompt: authorizationOptions.prompt,
+        mode: 'popup',
+      });
+
+      completion = this.waitForPopupCallback(popup, request.state, sessionEpoch);
+      waitingForCallback = true;
+      try {
+        // Setting the cross-origin Location is allowed by the browser and keeps
+        // the initially opened window handle available for the message handshake.
+        popup.location.href = request.authorizationUrl;
+      } catch (err) {
+        completion.cancel(new AIDAuthenticationError(
+          'Could not navigate the sign-in popup to the identity provider',
+          err,
+        ));
+      }
+      return await completion.promise;
+    } catch (err) {
+      if (state) {
+        try { this.clearTransactionForState(state); } catch { /* preserve the original failure */ }
+      }
+      if (!waitingForCallback) closePopup(popup);
+      throw err;
+    } finally {
+      try { browserWindow.removeEventListener('pagehide', onPageHide); } catch { /* best-effort listener cleanup */ }
+      this.releaseAuthorizationFlowLock(flowLockId);
+      this.cancelActivePopupSignIn = undefined;
+      this.popupSignInActive = false;
+    }
+  }
+
+  /**
+   * Cancel the active popup sign-in, closing its popup and clearing the pending
+   * authorization transaction. Returns `false` when no popup flow is active.
+   */
+  cancelPopupSignIn(): boolean {
+    if (!this.cancelActivePopupSignIn) return false;
+    return this.cancelActivePopupSignIn(new AIDAuthenticationError(
+      'Popup sign-in was cancelled by the user',
+      undefined,
+      { details: { reason: 'user_cancelled' } },
+    ));
+  }
+
+  /**
+   * Relay the current popup callback URL to the window that started
+   * {@link AID#signInWithPopup}. Call this on the registered callback route in
+   * the popup instead of {@link AID#handleCallback}.
+   */
+  async handlePopupCallback(url?: string): Promise<void> {
+    const current = url ?? getCurrentUrl();
+    if (current.length > MAX_POPUP_CALLBACK_URL_LENGTH) {
+      throw new AIDCallbackError('Popup callback URL exceeds the accepted size limit');
+    }
+    const validated = assertCallbackUrl(current, this.config.redirectUri, {
+      additionalOrigins: this.config.additionalRedirectOrigins,
     });
-    for (const [key, value] of Object.entries(authorizationOptions)) params.set(key, value);
-    // Authorization endpoints may already include query parameters. Use URL APIs so
-    // existing parameters are preserved, SDK-owned parameters replace collisions,
-    // and authorization parameters are never accidentally appended after a fragment.
-    for (const [key, value] of params) authorizationUrl.searchParams.set(key, value);
-    this.logger.info('signin.start', 'Starting authorization code flow with PKCE', {
-      issuer: this.config.issuer,
-      prompt: authorizationOptions.prompt,
+    const params = parseCallback(validated.toString());
+    if (!params.state || (!params.code && !params.error)) {
+      throw new AIDCallbackError('Popup callback is missing "state" or an authorization response');
+    }
+
+    const browserWindow = getBrowserWindow();
+    const opener = browserWindow.opener;
+    if (!opener || opener.closed) {
+      throw new AIDAuthenticationError(
+        'No live opener is available for this popup callback; use handleCallback() for redirect sign-in',
+      );
+    }
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      let challenged = false;
+      let openerOrigin: string | undefined;
+      const timeout = setTimeout(
+        () => finish(new AIDAuthenticationError('Timed out waiting for the sign-in popup to finish')),
+        cappedTimerDelay(this.config.transactionTtlMs),
+      );
+
+      const cleanup = (): void => {
+        clearTimeout(timeout);
+        try { browserWindow.removeEventListener('message', onMessage); } catch { /* best-effort listener cleanup */ }
+      };
+      const finish = (error?: unknown): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        closePopup(browserWindow);
+        if (error !== undefined) reject(error);
+        else resolve();
+      };
+      const onMessage = (event: MessageEvent): void => {
+        if (event.source !== opener) return;
+        const message = readPopupMessage(event.data);
+        if (!message || !params.state || !timingSafeEqual(message.state, params.state)) return;
+
+        if (message.type === 'challenge') {
+          if (challenged || !this.isAllowedPopupCallbackOrigin(event.origin)) return;
+          challenged = true;
+          openerOrigin = event.origin;
+          try {
+            opener.postMessage({
+              protocol: POPUP_MESSAGE_PROTOCOL,
+              type: 'callback',
+              state: params.state,
+              url: validated.toString(),
+            }, openerOrigin);
+          } catch (err) {
+            finish(new AIDAuthenticationError('Could not send the popup callback to its opener', err));
+          }
+          return;
+        }
+
+        if (message.type === 'complete') {
+          if (!this.isAllowedPopupCallbackOrigin(event.origin)) return;
+          if (!challenged) {
+            // A validated opener may reject an early state mismatch before it
+            // sends the challenge; only a negative result is trusted pre-challenge.
+            if (message.ok === false) {
+              finish(new AIDCallbackError('Popup authentication failed in the opener'));
+            }
+            return;
+          }
+          if (event.origin !== openerOrigin) return;
+          finish(message.ok === true
+            ? undefined
+            : new AIDCallbackError('Popup authentication failed in the opener'));
+        }
+      };
+
+      try {
+        browserWindow.addEventListener('message', onMessage);
+      } catch (err) {
+        finish(new AIDAuthenticationError('Could not listen for a response from the popup opener', err));
+        return;
+      }
+      try {
+        // The first message contains only state. The callback URL (and its
+        // single-use code) is sent only after the opener answers this challenge
+        // using an exact target origin.
+        opener.postMessage({
+          protocol: POPUP_MESSAGE_PROTOCOL,
+          type: 'hello',
+          state: params.state,
+        }, '*');
+      } catch (err) {
+        finish(new AIDAuthenticationError('Could not contact the popup opener', err));
+      }
     });
-    redirectTo(authorizationUrl.toString());
   }
 
   async handleCallback(url?: string): Promise<AIDCallbackResult> {
-    const current = url ?? getCurrentUrl();
+    return this.processCallback(url ?? getCurrentUrl());
+  }
+
+  private async processCallback(
+    current: string,
+    isCancelled?: () => boolean,
+  ): Promise<AIDCallbackResult> {
     // Reject a code that arrived on the wrong origin or path before anything
     // else happens: exchanging it would send a foreign code to our token endpoint.
     const validated = assertCallbackUrl(current, this.config.redirectUri, {
       additionalOrigins: this.config.additionalRedirectOrigins,
     });
+    const callbackIssuer = validated.searchParams.get('iss');
+    if (callbackIssuer !== null) {
+      let normalizedCallbackIssuer: string;
+      try { normalizedCallbackIssuer = normalizeIssuer(callbackIssuer); }
+      catch { throw new AIDCallbackError('Callback issuer does not match the configured issuer'); }
+      if (normalizedCallbackIssuer !== this.config.issuer) {
+        throw new AIDCallbackError('Callback issuer does not match the configured issuer');
+      }
+    }
     const params = parseCallback(validated.toString());
     if (params.error && params.code) {
       throw new AIDCallbackError('Callback contains both an "error" and a "code" parameter');
     }
     if (params.error) {
-      this.clearTransaction();
+      const transaction = this.loadTransaction();
+      if (!transaction) {
+        throw new AIDCallbackError('No authorization transaction found for the provider error response');
+      }
+      if (!params.state || !timingSafeEqual(transaction.state, params.state)) {
+        throw new AIDCallbackError('OAuth state mismatch in the provider error response');
+      }
+      this.clearTransactionForState(transaction.state);
       this.logger.warn('callback.provider_error', 'Authorization server returned an error', {
         error: params.error,
       });
       throw new AIDCallbackError(
         `Authorization error: ${params.error}` +
           (params.errorDescription ? ` — ${params.errorDescription}` : ''),
+        undefined,
+        params.error === 'access_denied' ? { details: { reason: 'provider_cancelled' } } : undefined,
       );
     }
     if (!params.code || !params.state) {
@@ -278,21 +587,29 @@ export class AID {
     }
     if (!Number.isFinite(transaction.createdAt) || transaction.createdAt > Date.now() ||
         Date.now() - transaction.createdAt > this.config.transactionTtlMs) {
-      this.clearTransaction();
+      this.clearTransactionForState(transaction.state);
       throw new AIDCallbackError('Authorization transaction has expired or is invalid');
     }
-    if (!transaction.state || !transaction.nonce || !transaction.codeVerifier ||
-        !transaction.redirectUri || !timingSafeEqual(transaction.state, params.state)) {
-      this.clearTransaction();
+    if (!transaction.state || !transaction.nonce || !transaction.codeVerifier || !transaction.redirectUri) {
+      this.clearTransactionForState(transaction.state);
+      throw new AIDCallbackError('OAuth state mismatch or invalid authorization transaction');
+    }
+    // A stale callback must never erase a different, newer transaction from
+    // storage. Leave a state mismatch untouched so its active flow can finish.
+    if (!timingSafeEqual(transaction.state, params.state)) {
       throw new AIDCallbackError('OAuth state mismatch or invalid authorization transaction');
     }
     // The transaction lives in application storage, which the SDK cannot sign.
     // Re-check that it still names this client's redirect URI before the code is
     // sent anywhere: a rewritten transaction must not redirect the exchange.
     if (transaction.redirectUri !== this.config.redirectUri) {
-      this.clearTransaction();
+      this.clearTransactionForState(transaction.state);
       throw new AIDCallbackError('Authorization transaction redirect URI does not match this client');
     }
+    if (this.processingCallbackStates.has(params.state)) {
+      throw new AIDCallbackError('Authorization callback is already being processed');
+    }
+    this.processingCallbackStates.add(params.state);
 
     // The transaction is cleared below, so read the return target before the exchange.
     const returnTo = transaction.returnTo;
@@ -320,6 +637,11 @@ export class AID {
         ),
         ...(transaction.maxAgeSeconds !== undefined ? { maxAgeSeconds: transaction.maxAgeSeconds } : {}),
       });
+      // A timeout/cancel can settle the popup while its network exchange is
+      // still pending. Never let that late callback create a session afterward.
+      if (isCancelled?.() === true) {
+        throw new AIDCallbackError('Popup sign-in was cancelled before the session could be saved');
+      }
       // A sign-out that happened while the code exchange was in flight wins:
       // completing the callback must not create a session the user just ended.
       if (this.sessionEpoch !== epoch) {
@@ -340,7 +662,8 @@ export class AID {
       this.logger.warn('callback.failed', 'Authorization callback failed', { error: err });
       throw err;
     } finally {
-      this.clearTransaction();
+      this.processingCallbackStates.delete(params.state);
+      this.clearTransactionForState(params.state);
     }
   }
 
@@ -488,6 +811,11 @@ export class AID {
     // clearSession() also advances the epoch, so a refresh already in flight
     // cannot re-persist the session after logout.
     this.clearSession();
+    this.cancelActivePopupSignIn?.(new AIDAuthenticationError(
+      'Popup sign-in was cancelled by sign-out',
+      undefined,
+      { details: { reason: 'sign_out' } },
+    ));
     this.config.storage.remove(this.transactionKey);
     const safeRedirect = options.redirectTo
       ? validatePostLogoutRedirect(
@@ -748,6 +1076,233 @@ export class AID {
     }
   }
 
+  private acquireAuthorizationFlowLock(id: string): void {
+    if (this.readActiveAuthorizationFlowLock()) {
+      throw new AIDAuthenticationError('An authorization flow is already active for this storage');
+    }
+    try {
+      this.config.storage.set(this.authorizationFlowLockKey, JSON.stringify({ id, createdAt: Date.now() }));
+    } catch (err) {
+      throw new AIDError('STORAGE_ERROR', 'Failed to claim the authorization-flow lock', err);
+    }
+  }
+
+  private readActiveAuthorizationFlowLock(): AuthorizationFlowLock | null {
+    let raw: string | null;
+    try {
+      raw = this.config.storage.get(this.authorizationFlowLockKey);
+    } catch (err) {
+      throw new AIDError('STORAGE_ERROR', 'Failed to read the authorization-flow lock', err);
+    }
+    if (!raw) return null;
+
+    let lock: unknown;
+    try { lock = JSON.parse(raw) as unknown; } catch { lock = null; }
+    if (lock && typeof lock === 'object' && !Array.isArray(lock)) {
+      const value = lock as Record<string, unknown>;
+      const age = typeof value.createdAt === 'number' ? Date.now() - value.createdAt : Number.NaN;
+      if (typeof value.id === 'string' && value.id.length > 0 && Number.isFinite(age) &&
+          age >= 0 && age <= this.config.transactionTtlMs) {
+        return { id: value.id, createdAt: value.createdAt as number };
+      }
+    }
+
+    try { this.config.storage.remove(this.authorizationFlowLockKey); }
+    catch (err) { throw new AIDError('STORAGE_ERROR', 'Failed to clear a stale authorization-flow lock', err); }
+    return null;
+  }
+
+  private releaseAuthorizationFlowLock(id: string): void {
+    try {
+      const raw = this.config.storage.get(this.authorizationFlowLockKey);
+      if (!raw) return;
+      const lock: unknown = JSON.parse(raw);
+      if (lock && typeof lock === 'object' && !Array.isArray(lock) &&
+          (lock as Record<string, unknown>).id === id) {
+        this.config.storage.remove(this.authorizationFlowLockKey);
+      }
+    } catch {
+      // Lock cleanup is best-effort and must not mask the sign-in outcome.
+    }
+  }
+
+  private waitForPopupCallback(popup: Window, state: string, sessionEpoch: number): PopupWaitHandle {
+    const browserWindow = getBrowserWindow();
+    let resolvePromise!: (result: AIDCallbackResult) => void;
+    let rejectPromise!: (error: unknown) => void;
+    const promise = new Promise<AIDCallbackResult>((resolve, reject) => {
+      resolvePromise = resolve;
+      rejectPromise = reject;
+    });
+
+    let callbackOrigin: string | undefined;
+    let callbackStarted = false;
+    let callbackCancelled = false;
+    let callbackProcessingSettled = false;
+    let settled = false;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    let closePoll: ReturnType<typeof setInterval> | undefined;
+
+    const cleanup = (): void => {
+      if (timeout !== undefined) clearTimeout(timeout);
+      if (closePoll !== undefined) clearInterval(closePoll);
+      try { browserWindow.removeEventListener('message', onMessage); } catch { /* best-effort listener cleanup */ }
+    };
+    const sendCompletion = (ok: boolean, completionState = state): void => {
+      if (!callbackOrigin) return;
+      try {
+        popup.postMessage({
+          protocol: POPUP_MESSAGE_PROTOCOL,
+          type: 'complete',
+          state: completionState,
+          ok,
+        }, callbackOrigin);
+      } catch {
+        // A popup that has navigated or closed cannot receive its completion.
+      }
+    };
+    const finish = (
+      error?: unknown,
+      result?: AIDCallbackResult,
+      completionState = state,
+    ): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (error !== undefined) {
+        if (callbackStarted && !callbackProcessingSettled) {
+          callbackCancelled = true;
+        }
+        sendCompletion(false, completionState);
+        try { this.clearTransactionForState(state); } catch { /* preserve the original error */ }
+        // Close from the opener even if the callback page has navigated away and
+        // can no longer receive the completion message.
+        closePopup(popup);
+        rejectPromise(error);
+        return;
+      }
+      sendCompletion(true);
+      resolvePromise(result as AIDCallbackResult);
+    };
+    const onMessage = (event: MessageEvent): void => {
+      if (event.source !== popup) return;
+      const message = readPopupMessage(event.data);
+      if (!message) return;
+
+      if (message.type === 'hello') {
+        if (!this.isAllowedPopupCallbackOrigin(event.origin) ||
+            (callbackOrigin !== undefined && callbackOrigin !== event.origin)) return;
+        callbackOrigin = event.origin;
+        if (!timingSafeEqual(message.state, state)) {
+          finish(
+            new AIDCallbackError('Popup callback state does not match the active transaction'),
+            undefined,
+            message.state,
+          );
+          return;
+        }
+        if (this.sessionEpoch !== sessionEpoch) {
+          finish(new AIDAuthenticationError('Sign-out occurred while popup sign-in was in progress'));
+          return;
+        }
+        const transaction = this.loadTransaction();
+        if (!transaction || !timingSafeEqual(transaction.state, state)) {
+          finish(new AIDCallbackError('No matching popup authorization transaction was found'));
+          return;
+        }
+        try {
+          // This challenge is sent only to the callback page's exact origin.
+          popup.postMessage({
+            protocol: POPUP_MESSAGE_PROTOCOL,
+            type: 'challenge',
+            state,
+          }, callbackOrigin);
+        } catch (err) {
+          finish(new AIDAuthenticationError('Could not challenge the sign-in popup', err));
+        }
+        return;
+      }
+
+      if (!timingSafeEqual(message.state, state)) return;
+      if (this.sessionEpoch !== sessionEpoch) {
+        finish(new AIDAuthenticationError('Sign-out occurred while popup sign-in was in progress'));
+        return;
+      }
+      if (message.type !== 'callback' || callbackStarted ||
+          !callbackOrigin || event.origin !== callbackOrigin ||
+          typeof message.url !== 'string') return;
+      if (message.url.length > MAX_POPUP_CALLBACK_URL_LENGTH) {
+        finish(new AIDCallbackError('Popup callback URL exceeds the accepted size limit'));
+        return;
+      }
+
+      let callbackUrl: URL;
+      try {
+        callbackUrl = assertCallbackUrl(message.url, this.config.redirectUri, {
+          additionalOrigins: this.config.additionalRedirectOrigins,
+        });
+        const params = parseCallback(callbackUrl.toString());
+        if (!params.state || !timingSafeEqual(params.state, state)) {
+          throw new AIDCallbackError('Popup callback state does not match the active transaction');
+        }
+        if (callbackUrl.origin !== event.origin) {
+          throw new AIDCallbackError('Popup callback origin does not match the sending window');
+        }
+      } catch (err) {
+        finish(err);
+        return;
+      }
+
+      callbackStarted = true;
+      void this.processCallback(callbackUrl.toString(), () => callbackCancelled).then(
+        (result) => {
+          callbackProcessingSettled = true;
+          finish(undefined, result);
+        },
+        (err: unknown) => {
+          callbackProcessingSettled = true;
+          finish(err);
+        },
+      );
+    };
+
+    browserWindow.addEventListener('message', onMessage);
+    timeout = setTimeout(
+      () => finish(new AIDAuthenticationError('Sign-in popup timed out')),
+      cappedTimerDelay(this.config.transactionTtlMs),
+    );
+    closePoll = setInterval(() => {
+      try {
+        if (popup.closed) {
+          finish(new AIDAuthenticationError(
+            'Sign-in popup was closed before authentication completed',
+            undefined,
+            { details: { reason: 'popup_closed' } },
+          ));
+        }
+      } catch {
+        // Window.closed is cross-origin readable, but a broken proxy should not
+        // cause a failed check; the transaction timeout remains the fallback.
+      }
+    }, POPUP_CLOSE_POLL_MS);
+
+    return {
+      promise,
+      cancel: (error) => finish(error),
+    };
+  }
+
+  private isAllowedPopupCallbackOrigin(origin: string): boolean {
+    try {
+      const parsed = new URL(origin);
+      const registeredOrigin = new URL(this.config.redirectUri).origin;
+      return parsed.origin === origin && isSecureUrl(parsed) &&
+        (origin === registeredOrigin || this.config.additionalRedirectOrigins.includes(origin));
+    } catch {
+      return false;
+    }
+  }
+
   private loadTransaction(): AuthTransaction | null {
     const raw = this.config.storage.get(this.transactionKey);
     if (!raw) return null;
@@ -781,6 +1336,11 @@ export class AID {
       }
       return transaction as unknown as AuthTransaction;
     } catch { this.clearTransaction(); return null; }
+  }
+
+  private clearTransactionForState(state: string): void {
+    const transaction = this.loadTransaction();
+    if (transaction && timingSafeEqual(transaction.state, state)) this.clearTransaction();
   }
 
   private clearTransaction(): void { this.config.storage.remove(this.transactionKey); }
@@ -953,6 +1513,67 @@ function redirectTo(url: string): void {
   globalThis.location.assign(url);
 }
 
+function getBrowserWindow(): Window {
+  if (typeof globalThis.window === 'undefined') {
+    throw new AIDError('CONFIGURATION_ERROR', 'Popup authentication requires a browser window');
+  }
+  return globalThis.window;
+}
+
+function openAuthenticationPopup(browserWindow: Window = getBrowserWindow()): Window {
+  if (typeof browserWindow.open !== 'function') {
+    throw new AIDError(
+      'CONFIGURATION_ERROR',
+      'Popup authentication is not available in this browser',
+      undefined,
+      { details: { reason: 'popup_unavailable' } },
+    );
+  }
+  const width = 520;
+  const height = 680;
+  const left = Math.max(0, Math.round(browserWindow.screenX + (browserWindow.outerWidth - width) / 2));
+  const top = Math.max(0, Math.round(browserWindow.screenY + (browserWindow.outerHeight - height) / 2));
+  let popup: Window | null;
+  try {
+    // Do not use noopener: the callback needs a narrowly validated opener channel.
+    popup = browserWindow.open(
+      'about:blank',
+      '_blank',
+      `popup=yes,width=${width},height=${height},left=${left},top=${top},resizable=yes,scrollbars=yes`,
+    );
+  } catch (err) {
+    throw new AIDAuthenticationError(
+      'Could not open the sign-in popup',
+      err,
+      { details: { reason: 'popup_blocked' } },
+    );
+  }
+  if (!popup) {
+    throw new AIDAuthenticationError(
+      'Sign-in popup was blocked; allow popups for this site or use signIn() for redirect authentication',
+      undefined,
+      { details: { reason: 'popup_blocked' } },
+    );
+  }
+  return popup;
+}
+
+function closePopup(popup: Window): void {
+  try { popup.close(); } catch { /* best-effort cleanup */ }
+}
+
+function readPopupMessage(value: unknown): PopupWireMessage | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const message = value as Record<string, unknown>;
+  if (message.protocol !== POPUP_MESSAGE_PROTOCOL ||
+      typeof message.type !== 'string' || !POPUP_MESSAGE_TYPES.has(message.type) ||
+      typeof message.state !== 'string') return null;
+  return message as unknown as PopupWireMessage;
+}
+
+function cappedTimerDelay(delayMs: number): number {
+  return Math.min(delayMs, MAX_TIMER_DELAY_MS);
+}
 
 const RESERVED_AUTHORIZATION_PARAMETERS = new Set([
   'client_id', 'redirect_uri', 'response_type', 'scope', 'state', 'nonce',

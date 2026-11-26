@@ -5,19 +5,23 @@ JavaScript/TypeScript, Android, and iOS SDKs for authenticating users with Ace I
 **Documentation:** [docs.ace-base.cc/projects/ace-id-sdk](https://docs.ace-base.cc/projects/ace-id-sdk)  
 **Source:** [tab-gl/aid-sdk](https://github.com/tab-gl/aid-sdk)
 
-## Release status
+## Release target: v0.2.5
 
-| Platform | Version | Status |
-| --- | --- | --- |
-| JavaScript / TypeScript | `0.2.4` | Published on [npm](https://www.npmjs.com/package/ace-id-sdk) |
-| Android | `0.2.4` | Published on [Maven Central](https://central.sonatype.com/artifact/cc.ace-base/ace-id-android) |
-| iOS (Swift Package) | `0.2.4` | Source only; no tagged release yet |
+The coordinated v0.2.5 artifacts are built and validated by the main-only release workflow. npm publication uses provenance; Android Maven Central publication is user-managed after staging; the iOS deliverable is a tagged Swift source archive (not a binary framework). See the [release checklist](RELEASE-CHECKLIST.md) for outstanding production sign-off gates.
+
+| Platform | v0.2.5 artifact |
+| --- | --- |
+| JavaScript / TypeScript | `ace-id-sdk@0.2.5` on [npm](https://www.npmjs.com/package/ace-id-sdk) |
+| Android | `ace-id-sdk-android-0.2.5.aar`; Maven Central staging/publish workflow |
+| iOS (Swift Package) | `0.2.5` source tag and archive; no binary framework |
 
 ## JavaScript / TypeScript
 
 ```bash
-npm install ace-id-sdk
+npm install ace-id-sdk@0.2.5
 ```
+
+Node.js runtimes require Node 20 or newer for the global Web Crypto API. Browser use requires Web Crypto in a secure context (HTTPS or localhost).
 
 Basic browser setup:
 
@@ -37,6 +41,94 @@ const session = await aid.handleCallback();
 console.log(session.user);
 ```
 
+### Popup sign-in
+
+`signInWithPopup()` uses the same Authorization Code + PKCE flow while leaving the current page open. It opens a blank popup synchronously (call it directly from a user click), then navigates it to the issuer. Keep popup relay and top-level redirect exchange on separate callback routes. Because each `AID` client has one `redirectUri`, configure one client per route:
+
+```ts
+const common = { issuer: "https://identity.example.com", clientId: "your-public-client-id" };
+const popupClient = new AID({
+  ...common,
+  redirectUri: "https://app.example.com/auth/popup-callback",
+});
+const redirectClient = new AID({
+  ...common,
+  redirectUri: "https://app.example.com/auth/redirect-callback",
+});
+
+// In the app's sign-in button:
+const session = await popupClient.signInWithPopup({ prompt: "select_account" });
+console.log(session.user);
+
+// On the popup-only callback route:
+await popupClient.handlePopupCallback();
+
+// If popups are blocked, offer this explicit redirect fallback instead:
+await redirectClient.signIn({ returnTo: "/dashboard" });
+
+// On the redirect-only callback route:
+const redirectedSession = await redirectClient.handleCallback();
+```
+
+Use the same storage configuration for both clients so the app reads the session produced by either flow. The opener validates the callback origin/path, state and optional OIDC `iss` response parameter, exchanges the code once, verifies the ID token, and stores the session. The popup relays only the callback URL through a source- and origin-checked `postMessage` handshake; tokens are never sent between windows. `handlePopupCallback()` closes the popup after the opener reports completion. Keep each callback page on its registered origin/path and avoid stripping its query before the SDK handles it. Closing the popup cancels the attempt, and a late token response cannot create a session. Call `cancelPopupSignIn()` to cancel an in-progress popup from the host UI; it returns `false` when no popup flow is active. Refreshing or navigating the opener while a popup is pending also cancels the attempt and closes the popup. Popups are not a good mobile default, and browser `Cross-Origin-Opener-Policy` settings can sever the opener connection. A runnable static [popup demo, setup guide and browser test record](examples/popup/README.md) are included.
+
+The SDK's optional `ace-id-sdk/ui` subpath provides a framework-agnostic sign-in sheet with configurable provider buttons; the issuer still controls account selection and consent. Pass supported OIDC hints such as `prompt` or `loginHint` through authorization options. If your issuer documents a provider-selection parameter, pass it with `additionalParameters` (there is no universal OIDC `provider` parameter). The React adapter also exposes `signInWithPopup()` and `handlePopupCallback()` through `useAceIDActions()`.
+
+### Framework-agnostic authentication sheet
+
+`createAuthSheet()` mounts a responsive, accessible sheet without React, a CSS import, a font CDN, or a provider-specific authentication dependency. It uses Figtree, stepped pixel corners, and square provider buttons. Desktop sign-in starts with the SDK popup flow; if the browser blocks the popup, the sheet automatically falls back to the redirect client. Narrow mobile viewports use redirect by default (`mobileAuth: "popup"` opts back into popup mode).
+
+Configure separate clients for the popup relay and top-level redirect callback routes, and share their storage. The SDK remains responsible for PKCE, state, nonce, callback validation, code exchange, token verification, and session storage; provider passwords are never entered into the sheet.
+
+```ts
+import { AID } from "ace-id-sdk";
+import { createAuthSheet } from "ace-id-sdk/ui";
+
+const common = {
+  issuer: "https://identity.example.com",
+  clientId: "your-public-client-id",
+};
+const popupClient = new AID({
+  ...common,
+  redirectUri: "https://app.example.com/auth/popup-callback",
+});
+const redirectClient = new AID({
+  ...common,
+  redirectUri: "https://app.example.com/auth/redirect-callback",
+});
+
+const sheet = createAuthSheet({
+  client: popupClient,
+  redirectClient,
+  returnTo: "/dashboard",
+  brand: { name: "Northstar", eyebrow: "NORTHSTAR WORKSPACE", logoUrl: "/brand-mark.svg" },
+  theme: { accent: "#c9f36b", border: "#202833", colorScheme: "light" },
+  providers: [
+    {
+      id: "google",
+      label: "Continue with Google",
+      icon: "google",
+      // Use the provider-selection hint documented by your issuer.
+      authorizationOptions: { additionalParameters: { kc_idp_hint: "google" } },
+    },
+    {
+      id: "company-sso",
+      label: "Continue with company SSO",
+      icon: { text: "SSO" },
+      authorizationOptions: { additionalParameters: { connection: "company" } },
+    },
+  ],
+  onSuccess: ({ user }) => renderSignedIn(user),
+  onCancel: (reason) => reportSignInCancelled(reason),
+  onError: (error) => reportSignInError(error),
+});
+
+document.querySelector("#sign-in")?.addEventListener("click", () => sheet.open());
+// When the host application no longer needs it: sheet.destroy();
+```
+
+`client` must use the popup-only callback route (call `handlePopupCallback()` there); `redirectClient` must use the top-level callback route (call `handleCallback()` there). Configure both with the same storage so either successful flow updates the same session. Use the provider hints supported by your issuer—provider IDs are not standardized by OIDC. Built-in icons are `google`, `apple`, `microsoft`, `github`, `email`, and `key`; custom providers can use `{ text: "SSO" }` or `{ src: "/provider.svg" }`. `theme` accepts light/dark palettes and color overrides; `brand` accepts a name, eyebrow, and HTTPS or same-origin logo. The bundled Figtree font is licensed under OFL-1.1 (see `FONT-LICENSE.txt`). Closing the sheet during a popup attempt cancels it; closing the sign-in popup or declining at the provider displays the cancellation state. The sheet's success, error, loading, and cancellation states are exposed to assistive technology and through the controller's `state` property.
+
 Session state, refresh and profile:
 
 ```ts
@@ -53,7 +145,7 @@ const token = await aid.getValidAccessToken();  // refreshes when needed
 const user = await aid.fetchUserProfile();      // UserInfo, subject-checked
 ```
 
-Entry points: `ace-id-sdk` (browser/Node), `ace-id-sdk/react`,
+Entry points: `ace-id-sdk` (browser/Node), `ace-id-sdk/ui` (framework-agnostic browser sheet), `ace-id-sdk/react`,
 `ace-id-sdk/server`, `ace-id-sdk/diagnostics`, `ace-id-sdk/testing`. Each is
 independently tree-shakeable with a size budget enforced in CI. Use
 `ace-id-sdk/server` only in trusted server runtimes. Never expose a client secret
@@ -61,7 +153,7 @@ in browser or mobile code.
 
 More: [API reference](https://docs.ace-base.cc/projects/ace-id-sdk-api) · [React](https://docs.ace-base.cc/projects/ace-id-sdk-react) ·
 [Server and SSR](https://docs.ace-base.cc/projects/ace-id-sdk-server) · [Errors](https://docs.ace-base.cc/projects/ace-id-sdk-errors) ·
-[Examples](https://docs.ace-base.cc/projects/ace-id-sdk-examples) · [Changelog](https://docs.ace-base.cc/projects/ace-id-sdk-changelog) ·
+[Examples](https://docs.ace-base.cc/projects/ace-id-sdk-examples) · [Changelog](CHANGELOG.md) · [Online changelog](https://docs.ace-base.cc/projects/ace-id-sdk-changelog) ·
 [Migrating to 0.2.4](https://docs.ace-base.cc/projects/ace-id-sdk-migration)
 
 ## Post-login redirects
@@ -94,11 +186,11 @@ sink. Without a `logger` or `debug: true`, the SDK logs nothing.
 
 ## Android (Maven Central)
 
-Available once the Maven Central publication is released:
+Use after the v0.2.5 Maven Central publication has completed:
 
 ```kotlin
 dependencies {
-    implementation("cc.ace-base:ace-id-android:0.2.4")
+    implementation("cc.ace-base:ace-id-android:0.2.5")
 }
 ```
 

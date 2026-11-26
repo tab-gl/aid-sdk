@@ -135,7 +135,7 @@ export interface CallbackUrlOptions {
  *
  * Checks, in order: a parseable absolute URL, a secure protocol, no embedded
  * credentials, an origin the application registered, and — unless disabled —
- * the registered callback path. Duplicated `code`, `state` or `error`
+ * the registered callback path. Duplicated `code`, `state`, `error` or `iss`
  * parameters are refused: a request carrying two codes is ambiguous, and
  * parameter pollution is a classic way to slip a second value past a
  * first-wins parser.
@@ -172,7 +172,7 @@ export function assertCallbackUrl(
   if (parsed.searchParams.has('redirect_uri')) {
     throw new AIDCallbackError('Callback URL must not contain a redirect_uri parameter');
   }
-  for (const parameter of ['code', 'state', 'error']) {
+  for (const parameter of ['code', 'state', 'error', 'iss']) {
     if (parsed.searchParams.getAll(parameter).length > 1) {
       throw new AIDCallbackError(`Callback URL contains duplicate "${parameter}" parameters`);
     }

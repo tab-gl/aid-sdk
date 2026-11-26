@@ -32,7 +32,11 @@ jobs:
           node-version: ${{ matrix.node-version }}
           cache: npm
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --no-fund
+      - name: Audit production and development dependencies
+        run: |
+          npm audit --omit=dev
+          npm audit
       - name: Typecheck
         run: npm run typecheck
       - name: Test
@@ -45,3 +49,9 @@ jobs:
         run: npm run verify:package
       - name: Check publish contents
         run: npm pack --dry-run
+      - name: Install and verify the generated tarball
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ace-id-sdk-pack"
+          TARBALL="$(npm pack --silent --pack-destination "$RUNNER_TEMP/ace-id-sdk-pack")"
+          npm run verify:tarball -- "$RUNNER_TEMP/ace-id-sdk-pack/$TARBALL"

@@ -7,3 +7,5 @@ coverage/
 .env.*
 !.env.example
 test-app/
+examples/popup/.env
+examples/popup/config.local.js

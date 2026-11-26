@@ -5,6 +5,7 @@ export default defineConfig({
     index: 'src/index.ts',
     'server/index': 'src/server/index.ts',
     'react/index': 'src/react/index.ts',
+    'ui/index': 'src/ui/index.ts',
     diagnostics: 'src/diagnostics.ts',
     'testing/oidc-mock': 'src/testing/oidc-mock.ts',
   },
